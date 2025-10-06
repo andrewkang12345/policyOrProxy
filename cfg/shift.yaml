@@ -1,0 +1,14 @@
+shifts:
+  mild:
+    state_wasserstein: 0.4
+    action_wasserstein: 0.3
+    seed: 21
+  medium:
+    state_wasserstein: 0.9
+    action_wasserstein: 0.6
+    seed: 23
+  severe:
+    state_wasserstein: 1.5
+    action_wasserstein: 1.1
+    seed: 29
+max_attempts: 5

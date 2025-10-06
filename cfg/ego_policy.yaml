@@ -1,0 +1,13 @@
+window_len: 6
+num_buckets: 2048
+num_prototypes: 4
+noise_std: 0.05
+sampling: stochastic  # options: stochastic, argmax
+quantization:
+  grid_size: 32
+  jitter: 0.01
+  length_scale: 1.0
+  clamp: true
+prototype_init:
+  max_speed: 3.5
+  seed: 7

@@ -1,0 +1,34 @@
+batch_size: 32
+data_config: policyOrProxy/cfg/data.yaml
+device: auto
+ego_policy: policyOrProxy/cfg/ego_policy.yaml
+epochs: 20
+latent_dim: 32
+log_interval: 10
+max_grad_norm: 5.0
+model:
+  action_dim: 2
+  agents: 1
+  dropout: 0.1
+  encoder_dim: 256
+  encoder_heads: 4
+  encoder_layers: 4
+  state_dim: 4
+  teams: 2
+num_workers: 0
+optimizer:
+  betas:
+  - 0.9
+  - 0.999
+  lr: 0.0003
+  weight_decay: 0.0
+paths:
+  data_root: /mnt/data/output/data/ood_manual/mild
+  run_dir: /mnt/data/output/runs/mapd_cvae_ood_manual_mild
+samples_per_state: 8
+scheduler:
+  min_lr: 1.0e-05
+  warmup_steps: 10
+seed: 21
+validate_interval: 1
+window_len: 6

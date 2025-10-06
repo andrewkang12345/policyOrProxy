@@ -1,0 +1,13 @@
+datasets:
+  iid_bad_shuffle:
+  - label: policy_0
+    path: /mnt/data/output/data/iid_bad_shuffle_variants/policy_0
+  - label: policy_1
+    path: /mnt/data/output/data/iid_bad_shuffle_variants/policy_1
+max_samples: 5000
+rollout:
+  batch_size: 32
+  device: auto
+  horizon: 16
+  num_workers: 0
+  split: test

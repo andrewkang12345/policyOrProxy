@@ -1,0 +1,19 @@
+batch_size: 8
+device: auto
+epochs: 20
+model:
+  decoder_hidden: 256
+  embed_dim: 64
+  hidden_dim: 256
+optimizer:
+  lr: 0.001
+paths:
+  data_root: /mnt/data/output/data/ood_manual/severe
+  data_roots:
+  - /mnt/data/output/data/ood_manual/severe_variants/policy_0
+  - /mnt/data/output/data/ood_manual/severe_variants/policy_1
+  run_dir: /mnt/data/output/runs/grover_cvae_ood_manual_severe
+seed: 23
+steps_per_epoch: 200
+triplet_margin: 1.0
+triplet_weight: 1.0

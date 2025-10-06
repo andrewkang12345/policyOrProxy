@@ -1,0 +1,21 @@
+datasets:
+  baseline: output/data/iid
+  ood_splits:
+    mild: output/data/ood/mild
+    medium: output/data/ood/medium
+    severe: output/data/ood/severe
+rollout:
+  horizon: 16
+  batch_size: 64
+  num_workers: 4
+  device: auto
+seeds: [3, 7, 13]
+metrics:
+  wasserstein: true
+  ade_fde: true
+  smoothness: true
+  collisions: true
+  invariance: true
+logging:
+  output_dir: output/eval
+  log_level: INFO

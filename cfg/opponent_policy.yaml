@@ -1,0 +1,24 @@
+arch: transformer
+window_len: 6
+state_dim: 4
+hidden_dim: 256
+layers: 4
+heads: 4
+dropout: 0.1
+activation: gelu
+max_speed: 3.5
+optimizer:
+  lr: 0.0005
+  weight_decay: 0.0
+  betas: [0.9, 0.98]
+training:
+  batch_size: 128
+  steps: 2000
+  grad_clip: 1.0
+  log_every: 50
+  eval_every: 200
+  device: auto
+divergence_targets:
+  state_wasserstein: 0.6
+  action_wasserstein: 0.4
+baseline_statistics: null

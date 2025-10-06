@@ -1,0 +1,33 @@
+batch_size: 32
+device: auto
+epochs: 20
+latent_dim: 32
+log_interval: 10
+max_grad_norm: 5.0
+model:
+  action_dim: 2
+  agents: 1
+  dropout: 0.1
+  encoder_dim: 256
+  encoder_heads: 4
+  encoder_layers: 4
+  reconstruction_loss: smooth_l1
+  sequence_length: 16
+  state_dim: 4
+  teams: 2
+num_workers: 0
+optimizer:
+  betas:
+  - 0.9
+  - 0.999
+  lr: 0.0003
+  weight_decay: 0.0
+paths:
+  data_root: /mnt/data/output/data/iid_good_shuffle
+  run_dir: /mnt/data/output/runs/global_cvae_iid_good_shuffle
+scheduler:
+  min_lr: 1.0e-05
+  warmup_steps: 10
+seed: 17
+validate_interval: 1
+window_len: 6
