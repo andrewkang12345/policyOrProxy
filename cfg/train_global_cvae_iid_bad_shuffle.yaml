@@ -1,6 +1,6 @@
 batch_size: 32
 device: auto
-epochs: 20
+epochs: 50
 latent_dim: 32
 log_interval: 10
 max_grad_norm: 5.0

@@ -1,6 +1,6 @@
 batch_size: 16
 device: auto
-epochs: 20
+epochs: 50
 latent_dim:
   global: 32
   local: 16

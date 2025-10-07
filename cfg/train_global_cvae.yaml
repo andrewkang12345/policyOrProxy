@@ -2,7 +2,7 @@ seed: 17
 device: auto
 log_interval: 50
 validate_interval: 2000
-epochs: 60
+epochs: 50
 batch_size: 64
 num_workers: 4
 latent_dim: 32
@@ -21,7 +21,7 @@ model:
   encoder_heads: 4
   dropout: 0.1
   action_dim: 2
-  agents: 6
+  agents: 1
   teams: 2
   sequence_length: 16
   state_dim: 4

@@ -1,4 +1,4 @@
-"""Grover-style CVAE with episode embeddings and triplet loss."""
+"""Grover-style policy representation: deterministic episode embeddings + conditioned imitation + triplet loss."""
 from __future__ import annotations
 
 import argparse
@@ -80,7 +80,8 @@ def load_episodes(root: Path, indexer: EpisodeIndexer, split: str, device: torch
 
 
 class GroverEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, embed_dim: int) -> None:
+    """Deterministic episode encoder: per-step MLP over [state, action], mean-pooled over time."""
+    def __init__(self, input_dim: int, hidden_dim: int, embed_dim: int, l2_normalize: bool = True) -> None:
         super().__init__()
         self.network = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
@@ -89,87 +90,136 @@ class GroverEncoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, embed_dim),
         )
+        self.l2_normalize = l2_normalize
 
     def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
-        seq = torch.cat([states, actions], dim=-1)
-        h = self.network(seq)
-        return h.mean(dim=0)
+        # states: (T, S), actions: (T, A)
+        seq = torch.cat([states, actions], dim=-1)  # (T, S+A)
+        h = self.network(seq)                       # (T, D)
+        z = h.mean(dim=0)                           # (D,)
+        if self.l2_normalize:
+            z = F.normalize(z, dim=0)
+        return z
 
 
-class GroverDecoder(nn.Module):
+class GaussianPolicyDecoder(nn.Module):
+    """
+    Policy network p(a|o, z): outputs mean and (diagonal) log-variance for a Gaussian over actions.
+    This turns imitation into (negative) log-likelihood rather than MSE.
+    """
     def __init__(self, state_dim: int, embed_dim: int, hidden_dim: int, action_dim: int) -> None:
         super().__init__()
-        self.mlp = nn.Sequential(
+        self.backbone = nn.Sequential(
             nn.Linear(state_dim + embed_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, action_dim),
         )
+        self.head_mean = nn.Linear(hidden_dim, action_dim)
+        self.head_logvar = nn.Linear(hidden_dim, action_dim)
 
-    def forward(self, states: torch.Tensor, embedding: torch.Tensor) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, embedding: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # states: (T, S), embedding: (D,)
         T = states.size(0)
-        emb = embedding.expand(T, -1)
-        inp = torch.cat([states, emb], dim=-1)
-        return self.mlp(inp)
+        emb = embedding.expand(T, -1)              # (T, D)
+        inp = torch.cat([states, emb], dim=-1)     # (T, S+D)
+        h = self.backbone(inp)                     # (T, H)
+        mean = self.head_mean(h)                   # (T, A)
+        logvar = self.head_logvar(h).clamp(min=-10.0, max=2.0)  # stability
+        return mean, logvar
+
+
+def gaussian_nll(mean: torch.Tensor, logvar: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """
+    NLL for diagonal Gaussian across action dims, averaged over time.
+    mean/logvar/target: (T, A)
+    """
+    inv_var = torch.exp(-logvar)
+    per_dim = 0.5 * ((target - mean) ** 2 * inv_var + logvar)   # (T, A)
+    return per_dim.sum(dim=-1).mean()                           # scalar
 
 
 @dataclass
 class GroverModel:
     encoder: GroverEncoder
-    decoder: GroverDecoder
+    decoder: GaussianPolicyDecoder
 
     def parameters(self):
         yield from self.encoder.parameters()
         yield from self.decoder.parameters()
 
 
-def sample_triplet(policies: Dict[str, List[Episode]]) -> Tuple[Episode, Episode, Episode]:
+def sample_ref_pos_neg(policies: Dict[str, List[Episode]]) -> Tuple[Episode, Episode, Episode]:
+    """
+    Returns: reference (e*), positive (e+) from SAME policy (distinct episodes),
+             negative (e-) from a DIFFERENT policy.
+    """
     valid_policies = [p for p, eps in policies.items() if len(eps) >= 2]
     if len(valid_policies) < 1 or len(policies) < 2:
-        raise RuntimeError("Grover training requires at least two policies and two episodes per policy")
-    anchor_policy = random.choice(valid_policies)
-    positive_policy = anchor_policy
-    negative_policy = random.choice([p for p in policies.keys() if p != anchor_policy])
-    anchor, positive = random.sample(policies[anchor_policy], 2)
-    negative = random.choice(policies[negative_policy])
-    return anchor, positive, negative
+        raise RuntimeError("Training requires at least two policies and two episodes per policy")
+    ref_policy = random.choice(valid_policies)
+    ref, pos = random.sample(policies[ref_policy], 2)
+    neg_policy = random.choice([p for p in policies.keys() if p != ref_policy])
+    neg = random.choice(policies[neg_policy])
+    return ref, pos, neg
 
 
-def evaluate(policies: Dict[str, List[Episode]], model: GroverModel, margin: float, weight: float) -> Dict[str, float]:
+def soft_triplet_loss(z_ref: torch.Tensor, z_pos: torch.Tensor, z_neg: torch.Tensor) -> torch.Tensor:
+    """
+    Paper-style smooth objective (squared-softmax flavor):
+    d = (1 + exp(||r - n||^2 - ||r - p||^2))^-2
+    We minimize 1 - d to push positive closer than negative.
+    """
+    d_pos = torch.sum((z_ref - z_pos) ** 2)
+    d_neg = torch.sum((z_ref - z_neg) ** 2)
+    score = torch.pow(1.0 + torch.exp(d_neg - d_pos), -2)
+    return 1.0 - score  # lower is better when pos closer than neg
+
+
+def evaluate(
+    policies: Dict[str, List[Episode]],
+    model: GroverModel,
+    triplet_weight: float,
+    triplet_type: str = "soft",
+    margin: float = 1.0,
+) -> Dict[str, float]:
     model.encoder.eval()
     model.decoder.eval()
     total_imitation = 0.0
     total_triplet = 0.0
     count = 0
     with torch.no_grad():
-        for anchor_policy, episodes in policies.items():
+        for ref_policy, episodes in policies.items():
             if len(episodes) < 2:
                 continue
             for idx in range(len(episodes) - 1):
-                anchor = episodes[idx]
-                positive = episodes[idx + 1]
-                negative_policy = random.choice([p for p in policies.keys() if p != anchor_policy])
-                negative = random.choice(policies[negative_policy])
-                anchor_embed = model.encoder(anchor.states, anchor.actions)
-                positive_embed = model.encoder(positive.states, positive.actions)
-                negative_embed = model.encoder(negative.states, negative.actions)
-                pred_actions = model.decoder(anchor.states, positive_embed)
-                imitation_loss = F.mse_loss(pred_actions, anchor.actions)
-                triplet_loss = F.triplet_margin_loss(
-                    anchor_embed.unsqueeze(0),
-                    positive_embed.unsqueeze(0),
-                    negative_embed.unsqueeze(0),
-                    margin=margin,
-                )
+                ref = episodes[idx]
+                pos = episodes[idx + 1]
+                neg_policy = random.choice([p for p in policies.keys() if p != ref_policy])
+                neg = random.choice(policies[neg_policy])
+
+                z_ref = model.encoder(ref.states, ref.actions)
+                z_pos = model.encoder(pos.states, pos.actions)
+                z_neg = model.encoder(neg.states, neg.actions)
+
+                mean, logvar = model.decoder(pos.states, z_ref)  # imitate e+ conditioned on e*
+                imitation_loss = gaussian_nll(mean, logvar, pos.actions)
+
+                if triplet_type == "margin":
+                    t_loss = F.triplet_margin_loss(
+                        z_ref.unsqueeze(0), z_pos.unsqueeze(0), z_neg.unsqueeze(0), margin=margin
+                    )
+                else:
+                    t_loss = soft_triplet_loss(z_ref, z_pos, z_neg)
+
                 total_imitation += float(imitation_loss)
-                total_triplet += float(triplet_loss)
+                total_triplet += float(t_loss)
                 count += 1
     if count == 0:
         return {"loss": float("nan"), "imitation": float("nan"), "triplet": float("nan")}
     imitation = total_imitation / count
     triplet = total_triplet / count
-    return {"loss": imitation + weight * triplet, "imitation": imitation, "triplet": triplet}
+    return {"loss": imitation + triplet_weight * triplet, "imitation": imitation, "triplet": triplet}
 
 
 def train(config: Dict) -> None:
@@ -197,15 +247,18 @@ def train(config: Dict) -> None:
     train_policies = aggregate("train")
     val_policies = aggregate("val")
 
-    state_dim = next(iter(train_policies.values()))[0].states.size(-1)
-    action_dim = next(iter(train_policies.values()))[0].actions.size(-1)
+    # Infer dims
+    first_episode = next(iter(train_policies.values()))[0]
+    state_dim = first_episode.states.size(-1)
+    action_dim = first_episode.actions.size(-1)
 
     encoder = GroverEncoder(
         input_dim=state_dim + action_dim,
         hidden_dim=int(config["model"]["hidden_dim"]),
         embed_dim=int(config["model"]["embed_dim"]),
+        l2_normalize=bool(config["model"].get("l2_normalize", True)),
     ).to(device)
-    decoder = GroverDecoder(
+    decoder = GaussianPolicyDecoder(
         state_dim=state_dim,
         embed_dim=int(config["model"]["embed_dim"]),
         hidden_dim=int(config["model"]["decoder_hidden"]),
@@ -214,49 +267,62 @@ def train(config: Dict) -> None:
     model = GroverModel(encoder=encoder, decoder=decoder)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=float(config["optimizer"]["lr"]))
-    triplet_margin = float(config.get("triplet_margin", 1.0))
     triplet_weight = float(config.get("triplet_weight", 1.0))
+    triplet_type = str(config.get("triplet_type", "soft"))  # "soft" or "margin"
+    triplet_margin = float(config.get("triplet_margin", 1.0))
     batch_size = int(config.get("batch_size", 16))
 
     best_val = None
-    for epoch in range(1, int(config["epochs"]) + 1):
+    steps_per_epoch = int(config.get("steps_per_epoch", 200))
+    epochs = int(config["epochs"])
+
+    for epoch in range(1, epochs + 1):
+        model.encoder.train()
+        model.decoder.train()
         total_loss = 0.0
         total_imitation = 0.0
         total_triplet = 0.0
         steps = 0
-        model.encoder.train()
-        model.decoder.train()
-        num_batches = int(config.get("steps_per_epoch", 200))
-        for _ in range(num_batches):
+
+        for _ in range(steps_per_epoch):
             optimizer.zero_grad()
             loss_accum = 0.0
             imitation_accum = 0.0
             triplet_accum = 0.0
+
             for _ in range(batch_size):
-                anchor, positive, negative = sample_triplet(train_policies)
-                anchor_embed = model.encoder(anchor.states, anchor.actions)
-                positive_embed = model.encoder(positive.states, positive.actions)
-                negative_embed = model.encoder(negative.states, negative.actions)
-                pred_actions = model.decoder(anchor.states, positive_embed)
-                imitation_loss = F.mse_loss(pred_actions, anchor.actions)
-                triplet_loss = F.triplet_margin_loss(
-                    anchor_embed.unsqueeze(0),
-                    positive_embed.unsqueeze(0),
-                    negative_embed.unsqueeze(0),
-                    margin=triplet_margin,
-                )
-                loss = imitation_loss + triplet_weight * triplet_loss
+                ref, pos, neg = sample_ref_pos_neg(train_policies)
+
+                z_ref = model.encoder(ref.states, ref.actions)
+                z_pos = model.encoder(pos.states, pos.actions)
+                z_neg = model.encoder(neg.states, neg.actions)
+
+                mean, logvar = model.decoder(pos.states, z_ref)  # imitate e+ conditioned on e*
+                imitation_loss = gaussian_nll(mean, logvar, pos.actions)
+
+                if triplet_type == "margin":
+                    t_loss = F.triplet_margin_loss(
+                        z_ref.unsqueeze(0), z_pos.unsqueeze(0), z_neg.unsqueeze(0), margin=triplet_margin
+                    )
+                else:
+                    t_loss = soft_triplet_loss(z_ref, z_pos, z_neg)
+
+                loss = imitation_loss + triplet_weight * t_loss
+
                 loss_accum += loss
                 imitation_accum += imitation_loss
-                triplet_accum += triplet_loss
+                triplet_accum += t_loss
+
             loss_accum /= batch_size
             loss_accum.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
+
             total_loss += float(loss_accum.detach())
-            total_imitation += float(imitation_accum.detach() / batch_size)
-            total_triplet += float(triplet_accum.detach() / batch_size)
+            total_imitation += float((imitation_accum / batch_size).detach())
+            total_triplet += float((triplet_accum / batch_size).detach())
             steps += 1
+
         LOGGER.info(
             "Epoch %d train: loss=%.4f imitation=%.4f triplet=%.4f",
             epoch,
@@ -264,7 +330,10 @@ def train(config: Dict) -> None:
             total_imitation / max(steps, 1),
             total_triplet / max(steps, 1),
         )
-        val_metrics = evaluate(val_policies, model, triplet_margin, triplet_weight)
+
+        val_metrics = evaluate(
+            val_policies, model, triplet_weight=triplet_weight, triplet_type=triplet_type, margin=triplet_margin
+        )
         LOGGER.info(
             "Epoch %d val: loss=%.4f imitation=%.4f triplet=%.4f",
             epoch,
@@ -272,6 +341,7 @@ def train(config: Dict) -> None:
             val_metrics["imitation"],
             val_metrics["triplet"],
         )
+
         current = val_metrics["loss"]
         if best_val is None or current < best_val:
             best_val = current
@@ -281,16 +351,18 @@ def train(config: Dict) -> None:
                 {
                     "encoder": model.encoder.state_dict(),
                     "decoder": model.decoder.state_dict(),
-                    "triplet_margin": triplet_margin,
                     "triplet_weight": triplet_weight,
+                    "triplet_type": triplet_type,
+                    "triplet_margin": triplet_margin,
                 },
                 ckpt_path / "best.pt",
             )
+
     LOGGER.info("Training complete. Best validation loss %.4f", best_val if best_val is not None else float("nan"))
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train Grover-style CVAE")
+    parser = argparse.ArgumentParser(description="Train Grover-style policy representation model")
     parser.add_argument("--config", type=str, required=True)
     return parser.parse_args()
 

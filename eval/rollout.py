@@ -199,6 +199,9 @@ def run_evaluation(model_type: str, model_cfg: Dict, ckpt: Path, eval_cfg: Dict,
                 samples_per_state,
             )
             return model(batch["window"], dist_features)
+    elif model_type == "hier":
+        def forward(batch):
+            return model(batch["window"], episode_ids=batch["episode_id"])
     else:
         def forward(batch):
             return model(batch["window"])

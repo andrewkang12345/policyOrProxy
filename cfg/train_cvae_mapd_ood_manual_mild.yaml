@@ -2,7 +2,7 @@ batch_size: 32
 data_config: policyOrProxy/cfg/data.yaml
 device: auto
 ego_policy: policyOrProxy/cfg/ego_policy.yaml
-epochs: 20
+epochs: 50
 latent_dim: 32
 log_interval: 10
 max_grad_norm: 5.0

@@ -100,20 +100,22 @@ class HierarchicalCVAE(nn.Module):
         )
 
     def encode(self, window: torch.Tensor) -> Dict[str, torch.Tensor]:
+        if window.dim() == 6:
+            window = window.squeeze(1)
         batch = window.size(0)
         flattened = window.view(batch, self.window_len, self.teams * self.agents * self.state_dim)
         embedded = self.input_proj(flattened)
         embedded = self.positional(embedded)
         encoded = self.encoder(embedded)
-        context_global = encoded.mean(dim=1)
-        mu_global = self.to_mu_global(context_global)
-        logvar_global = self.to_logvar_global(context_global)
-        last_frame = window[:, -1].view(batch, self.teams, self.agents, self.state_dim)
-        local_context = last_frame.permute(0, 2, 1, 3).reshape(batch, self.agents, self.teams * self.state_dim)
+        sequence_context = encoded.mean(dim=1)
+        last_frame = window[:, -1]
+        last_flat = last_frame.reshape(batch, -1)
+        if last_flat.size(-1) % self.agents != 0:
+            raise RuntimeError('Incompatible agent dimension for hierarchical CVAE')
+        per_agent_dim = last_flat.size(-1) // self.agents
+        local_context = last_flat.view(batch, self.agents, per_agent_dim)
         return {
-            "mu_global": mu_global,
-            "logvar_global": logvar_global,
-            "context_global": context_global,
+            "sequence_context": sequence_context,
             "local_context": local_context,
         }
 
@@ -140,9 +142,31 @@ class HierarchicalCVAE(nn.Module):
         logvar = hidden[..., 1]
         return {"mean": mean, "logvar": logvar}
 
-    def forward(self, window: torch.Tensor, deterministic: bool = False) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        window: torch.Tensor,
+        episode_ids: torch.Tensor | None = None,
+        deterministic: bool = False,
+    ) -> Dict[str, torch.Tensor]:
         encoded = self.encode(window)
-        z_global = self.sample_global(encoded["mu_global"], encoded["logvar_global"], deterministic=deterministic)
+        sequence_context = encoded["sequence_context"]
+        device = window.device
+        batch = sequence_context.size(0)
+        if episode_ids is None:
+            episode_ids = torch.arange(batch, device=device, dtype=torch.long)
+        else:
+            episode_ids = episode_ids.to(device=device, dtype=torch.long)
+        unique_ids, inverse = torch.unique(episode_ids, sorted=True, return_inverse=True)
+        episode_sums = torch.zeros(unique_ids.size(0), sequence_context.size(-1), device=device)
+        episode_sums.index_add_(0, inverse, sequence_context)
+        counts = torch.bincount(inverse, minlength=unique_ids.size(0)).float().to(device).unsqueeze(-1)
+        episode_mean = episode_sums / counts.clamp_min(1.0)
+        mu_episode = self.to_mu_global(episode_mean)
+        logvar_episode = self.to_logvar_global(episode_mean)
+        z_episode = self.sample_global(mu_episode, logvar_episode, deterministic=deterministic)
+        mu_global = mu_episode[inverse]
+        logvar_global = logvar_episode[inverse]
+        z_global = z_episode[inverse]
         local_input = torch.cat([encoded["local_context"], z_global.unsqueeze(1).expand(-1, self.agents, -1)], dim=-1)
         local_hidden = torch.tanh(self.local_hidden(local_input))
         mu_local = self.to_mu_local(local_hidden)
@@ -150,7 +174,8 @@ class HierarchicalCVAE(nn.Module):
         z_local = self.sample_local(mu_local, logvar_local, deterministic=deterministic)
         decoded = self.decode(encoded["local_context"], z_global, z_local)
         return {
-            **encoded,
+            "mu_global": mu_global,
+            "logvar_global": logvar_global,
             "mu_local": mu_local,
             "logvar_local": logvar_local,
             "z_global": z_global,
@@ -163,15 +188,25 @@ class HierarchicalCVAE(nn.Module):
         logvar = outputs["logvar"]
         recon = 0.5 * ((actions - mean).pow(2) * torch.exp(-logvar) + logvar)
         recon = recon.sum(dim=[1, 2]).mean()
-        kl_global = -0.5 * torch.sum(1 + outputs["logvar_global"] - outputs["mu_global"].pow(2) - outputs["logvar_global"].exp(), dim=1).mean()
-        kl_local = -0.5 * torch.sum(1 + outputs["logvar_local"] - outputs["mu_local"].pow(2) - outputs["logvar_local"].exp(), dim=[1, 2]).mean()
+        kl_global = -0.5 * torch.sum(
+            1 + outputs["logvar_global"] - outputs["mu_global"].pow(2) - outputs["logvar_global"].exp(),
+            dim=1,
+        ).mean()
+        kl_local = -0.5 * torch.sum(
+            1 + outputs["logvar_local"] - outputs["mu_local"].pow(2) - outputs["logvar_local"].exp(),
+            dim=[1, 2],
+        ).mean()
         loss = recon + kl_global + kl_local
         return {"loss": loss, "recon": recon, "kl_global": kl_global, "kl_local": kl_local}
 
-    def sample(self, window: torch.Tensor, deterministic: bool = False) -> torch.Tensor:
-        outputs = self.forward(window, deterministic=deterministic)
+    def sample(
+        self,
+        window: torch.Tensor,
+        episode_ids: torch.Tensor | None = None,
+        deterministic: bool = False,
+    ) -> torch.Tensor:
+        outputs = self.forward(window, episode_ids=episode_ids, deterministic=deterministic)
         return outputs["mean"]
-
 
 def load_config(path: Path) -> Dict:
     with path.open("r", encoding="utf-8") as fp:
@@ -225,7 +260,7 @@ def train_one_epoch(model, dataloader, optimizer, device):
     total = {"loss": 0.0, "recon": 0.0, "kl_global": 0.0, "kl_local": 0.0}
     for batch in dataloader:
         batch = move_batch(batch, device)
-        outputs = model(batch["window"])
+        outputs = model(batch["window"], episode_ids=batch["episode_id"])
         losses = model.module.loss(outputs, batch["action"]) if isinstance(model, nn.DataParallel) else model.loss(outputs, batch["action"])
         optimizer.zero_grad()
         losses["loss"].backward()
@@ -243,7 +278,7 @@ def evaluate(model, dataloader, device):
     total = {"loss": 0.0, "recon": 0.0, "kl_global": 0.0, "kl_local": 0.0}
     for batch in dataloader:
         batch = move_batch(batch, device)
-        outputs = model(batch["window"])
+        outputs = model(batch["window"], episode_ids=batch["episode_id"])
         losses = model.module.loss(outputs, batch["action"]) if isinstance(model, nn.DataParallel) else model.loss(outputs, batch["action"])
         for key in total:
             total[key] += float(losses[key].detach())

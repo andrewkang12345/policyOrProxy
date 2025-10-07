@@ -63,8 +63,9 @@ def build_feature_model(model_type: str, model_cfg: Dict, device: torch.device):
             dropout=float(model_cfg["model"]["dropout"]),
             action_dim=int(model_cfg["model"]["action_dim"]),
         ).to(device)
-        latent_key = "z"
+        latent_key = "z"  # leave as-is for global model unless you prefer "mu"
         return model, latent_key, {}
+
     if model_type == "hier":
         model = HierarchicalCVAE(
             window_len=int(model_cfg["window_len"]),
@@ -79,8 +80,10 @@ def build_feature_model(model_type: str, model_cfg: Dict, device: torch.device):
             dropout=float(model_cfg["model"]["dropout"]),
             action_dim=int(model_cfg["model"]["action_dim"]),
         ).to(device)
-        latent_key = "z_global"
+        # Use the deterministic mean of the global latent for representations
+        latent_key = "mu_global"
         return model, latent_key, {}
+
     if model_type == "mapd":
         agents = int(model_cfg["model"]["agents"])
         model = MAPDCVAE(
@@ -103,9 +106,11 @@ def build_feature_model(model_type: str, model_cfg: Dict, device: torch.device):
             "ego_policy": model_cfg.get("ego_policy", "policyOrProxy/cfg/ego_policy.yaml"),
         }
         return model, latent_key, extras
+
     if model_type == "grover":
         # encoder built later in grover-specific flow
         return None, "embedding", {}
+
     raise ValueError(f"Unsupported model type {model_type}")
 
 
@@ -257,8 +262,38 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
         run_grover_diagnostics(model_cfg, checkpoint, eval_cfg, output, device)
         return
 
-    state_dict = torch.load(checkpoint, map_location=device)
-    (model.module if isinstance(model, torch.nn.DataParallel) else model).load_state_dict(state_dict)
+    ckpt = torch.load(checkpoint, map_location=device)
+
+    # Unwrap common checkpoint formats
+    if isinstance(ckpt, dict):
+        for k in ["model_state", "state_dict", "model"]:
+            if k in ckpt:
+                state_dict = ckpt[k]
+                break
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
+
+    # If the keys are prefixed with "module.", strip them for non-DataParallel models
+    def strip_module_prefix(sd):
+        if not len(sd):
+            return sd
+        needs_strip = next(iter(sd)).startswith("module.")
+        if not needs_strip:
+            return sd
+        return {k[len("module."):]: v for k, v in sd.items()}
+
+    state_dict = strip_module_prefix(state_dict)
+
+    target = model.module if isinstance(model, torch.nn.DataParallel) else model
+    missing, unexpected = target.load_state_dict(state_dict, strict=False)
+    if missing or unexpected:
+        LOGGER.warning("Loaded with missing keys: %s", missing)
+        LOGGER.warning("Loaded with unexpected keys: %s", unexpected)
+
+    # IMPORTANT: disable dropout / use running stats
+    target.eval()
 
     batch_size = int(eval_cfg["rollout"]["batch_size"])
     num_workers = int(eval_cfg["rollout"].get("num_workers", 0))
@@ -269,7 +304,6 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
     if not dataset_specs:
         raise ValueError("Evaluation config must specify datasets")
 
-    forward_fn = None
     if model_type == "mapd":
         data_cfg = load_yaml(Path(extras["data_config"]))
         ego_cfg = load_yaml(Path(extras["ego_policy"]))
@@ -288,10 +322,12 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
                 bank,
                 samples_per_state,
             )
+            # keep any stochasticity in dist features but disable model sampling with deterministic forward if supported
             return model(batch["window"], dist_features)
     else:
+        # Deterministic forward: bypass latent sampling noise
         def forward(batch):
-            return model(batch["window"])
+            return model(batch["window"], deterministic=True)
 
     grouped_embeddings: Dict[str, List[np.ndarray]] = defaultdict(list)
     for distribution, spec in dataset_specs.items():
@@ -305,6 +341,7 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
                 indexer,
                 split=split_name,
                 include_policy_id=True,
+                window_len=int(model_cfg["window_len"]),  # align eval window with model
             )
             loader = DataLoader(
                 dataset,
