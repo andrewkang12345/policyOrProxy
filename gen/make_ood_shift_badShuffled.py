@@ -26,6 +26,12 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
 
+def iter_policies(base: Path, policies: list[str] | None) -> list[Path]:
+    if policies:
+        return [base / name for name in policies]
+    return [p for p in sorted(base.iterdir()) if p.is_dir()]
+
+
 def shuffle_split(source_root: Path, target_root: Path) -> None:
     indexer = EpisodeIndexer.load(source_root)
     target_root.mkdir(parents=True, exist_ok=True)
@@ -45,7 +51,7 @@ def shuffle_split(source_root: Path, target_root: Path) -> None:
                 actions.append(data["ego_actions"])
                 opponents.append(data["opponent_actions"])
                 positions.append(data["positions"])
-                policy = data["policy_id"] if "policy_id" in data else "baseline"
+                policy = data["policy_id"] if "policy_id" in data else source_root.parent.name
                 policies.append(policy.item() if hasattr(policy, "item") else policy)
         concat = np.concatenate([a.reshape(a.shape[0], -1) for a in actions], axis=0)
         perm = rng.permutation(concat.shape[0])
@@ -76,27 +82,34 @@ def shuffle_split(source_root: Path, target_root: Path) -> None:
         copyfile(stats_path, target_root / "baseline_stats.npz")
 
 
-def main(source: Path, target: Path) -> None:
+def main(base: Path, dataset: str, target: str, policies: list[str] | None) -> None:
     configure_logging()
-    source = resolve_path(source)
-    target = resolve_path(target)
-    target.mkdir(parents=True, exist_ok=True)
-    for shift_dir in sorted(path for path in source.iterdir() if path.is_dir()):
-        LOGGER.info("Shuffling shift %s", shift_dir.name)
-        shuffle_split(shift_dir, target / shift_dir.name)
-    report = source / "divergence_report.json"
-    if report.exists():
-        copyfile(report, target / "divergence_report.json")
-    LOGGER.info("Shuffled OOD datasets stored in %s", target)
+    base = resolve_path(base)
+    for policy_root in iter_policies(base, policies):
+        source = policy_root / dataset
+        if not source.exists():
+            LOGGER.warning("Skipping %s (missing %s)", policy_root.name, dataset)
+            continue
+        target_root = policy_root / target
+        target_root.mkdir(parents=True, exist_ok=True)
+        for shift_dir in sorted(path for path in source.iterdir() if path.is_dir()):
+            LOGGER.info("[%s] Shuffling shift %s", policy_root.name, shift_dir.name)
+            shuffle_split(shift_dir, target_root / shift_dir.name)
+        report = source / "divergence_report.json"
+        if report.exists():
+            (target_root / "divergence_report.json").write_bytes(report.read_bytes())
+        LOGGER.info("[%s] Shuffled OOD stored in %s", policy_root.name, target_root)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Shuffle OOD datasets")
-    parser.add_argument("--source", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
-    parser.add_argument("--target", type=str, default=str((PACKAGE_ROOT / "../output/data/ood_bad_shuffle").resolve()))
+    parser.add_argument("--base", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
+    parser.add_argument("--dataset", type=str, default="ood")
+    parser.add_argument("--target", type=str, default="ood_bad_shuffle")
+    parser.add_argument("--policy", action="append", help="Specific policy directories to process")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(Path(args.source), Path(args.target))
+    main(Path(args.base), args.dataset, args.target, args.policy)

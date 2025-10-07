@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import List
 import sys
 
 import numpy as np
@@ -62,11 +63,18 @@ def write_episode(
     np.savez_compressed(path, **payload)
 
 
-def main(source: Path, target: Path) -> None:
-    configure_logging()
-    rng = np.random.default_rng(29)
-    source = resolve_path(source)
-    target = resolve_path(target)
+def iter_policies(base: Path, policies: list[str] | None) -> List[Path]:
+    if policies:
+        return [base / name for name in policies]
+    return [p for p in sorted(base.iterdir()) if p.is_dir()]
+
+
+def process_policy(policy_root: Path, dataset: str, target_name: str, rng: np.random.Generator) -> None:
+    source = policy_root / dataset
+    if not source.exists():
+        LOGGER.warning("Skipping %s (missing %s)", policy_root.name, dataset)
+        return
+    target = policy_root / target_name
     indexer = EpisodeIndexer.load(source)
     target.mkdir(parents=True, exist_ok=True)
     new_indexer = EpisodeIndexer(root=target)
@@ -81,14 +89,14 @@ def main(source: Path, target: Path) -> None:
                 actions = data["ego_actions"]
                 opponent_actions = data.get("opponent_actions")
                 positions = data.get("positions")
-                policy = data.get("policy_id", "baseline")
+                policy = data.get("policy_id", policy_root.name)
                 if hasattr(policy, "item"):
                     policy = policy.item()
             shuffled = shuffle_episode(rng, windows, actions, opponent_actions, positions)
             episode_path = split_dir / f"episode_{idx:05d}.npz"
             write_episode(episode_path, *shuffled, policy_id=policy)
             new_indexer.add_episode(split, episode_path, length=actions.shape[0], policy_id=policy)
-        LOGGER.info("Per-episode shuffled split %s", split)
+        LOGGER.info("[%s] per-episode shuffled split %s", policy_root.name, split)
     new_indexer.save()
     baseline_stats = source / "baseline_stats.npz"
     if baseline_stats.exists():
@@ -96,13 +104,23 @@ def main(source: Path, target: Path) -> None:
     LOGGER.info("Per-episode shuffled dataset stored in %s", target)
 
 
+def main(base: Path, dataset: str, target: str, policies: list[str] | None) -> None:
+    configure_logging()
+    rng = np.random.default_rng(29)
+    base = resolve_path(base)
+    for policy_root in iter_policies(base, policies):
+        process_policy(policy_root, dataset, target, rng)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Shuffle dataset within each episode")
-    parser.add_argument("--source", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
-    parser.add_argument("--target", type=str, default=str((PACKAGE_ROOT / "../output/data/iid_good_shuffle").resolve()))
+    parser.add_argument("--base", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
+    parser.add_argument("--dataset", type=str, default="iid")
+    parser.add_argument("--target", type=str, default="iid_good_shuffle")
+    parser.add_argument("--policy", action="append", help="Specific policy directories to process")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(Path(args.source), Path(args.target))
+    main(Path(args.base), args.dataset, args.target, args.policy)

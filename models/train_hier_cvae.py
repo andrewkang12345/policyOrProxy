@@ -286,11 +286,12 @@ def evaluate(model, dataloader, device):
     return {key: value / steps for key, value in total.items()}
 
 
-def train(config: Dict) -> None:
+def train(config: Dict, data_root: Path | None = None, run_dir: Path | None = None) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and config.get("device", "auto") != "cpu" else "cpu")
     set_seed(int(config["seed"]))
-    data_root = Path(config["paths"]["data_root"]).expanduser()
-    run_dir = Path(config["paths"]["run_dir"]).expanduser()
+    paths_cfg = config.get("paths", {})
+    data_root = (data_root or Path(paths_cfg.get("data_root", "output/data"))).expanduser()
+    run_dir = (run_dir or Path(paths_cfg.get("run_dir", "output/runs/hier_cvae"))).expanduser()
     configure_logging(run_dir)
     LOGGER.info("Starting hierarchical CVAE training on %s", device)
     indexer = EpisodeIndexer.load(data_root)
@@ -363,13 +364,17 @@ def train(config: Dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train hierarchical CVAE")
     parser.add_argument("--config", type=str, default="policyOrProxy/cfg/train_hier_cvae.yaml")
+    parser.add_argument("--data_root", type=str, help="Override data root")
+    parser.add_argument("--run_dir", type=str, help="Override run directory")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(Path(args.config))
-    train(config)
+    data_root = Path(args.data_root).expanduser() if args.data_root else None
+    run_dir = Path(args.run_dir).expanduser() if args.run_dir else None
+    train(config, data_root=data_root, run_dir=run_dir)
 
 
 if __name__ == "__main__":

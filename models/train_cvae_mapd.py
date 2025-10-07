@@ -271,16 +271,23 @@ def evaluate(model, dataloader, device, regionizer, bank, samples_per_state):
     return {key: value / steps for key, value in total.items()}
 
 
-def train(config: Dict) -> None:
-    data_cfg_path = Path(config.get("data_config", "policyOrProxy/cfg/data.yaml"))
-    ego_cfg_path = Path(config.get("ego_policy", "policyOrProxy/cfg/ego_policy.yaml"))
-    data_cfg = load_config(data_cfg_path)
-    ego_cfg = load_config(ego_cfg_path)
+def train(
+    config: Dict,
+    data_root: Path | None = None,
+    run_dir: Path | None = None,
+    data_cfg_path: Path | None = None,
+    ego_cfg_path: Path | None = None,
+) -> None:
+    cfg_data_path = Path(config.get("data_config", "policyOrProxy/cfg/data.yaml"))
+    cfg_ego_path = Path(config.get("ego_policy", "policyOrProxy/cfg/ego_policy.yaml"))
+    data_cfg = load_config(data_cfg_path or cfg_data_path)
+    ego_cfg = load_config(ego_cfg_path or cfg_ego_path)
 
     set_seed(int(config["seed"]))
     device = torch.device("cuda" if torch.cuda.is_available() and config.get("device", "auto") != "cpu" else "cpu")
-    data_root = Path(config["paths"]["data_root"]).expanduser()
-    run_dir = Path(config["paths"]["run_dir"]).expanduser()
+    paths_cfg = config.get("paths", {})
+    data_root = (data_root or Path(paths_cfg.get("data_root", "output/data"))).expanduser()
+    run_dir = (run_dir or Path(paths_cfg.get("run_dir", "output/runs/mapd_cvae"))).expanduser()
     configure_logging(run_dir)
 
     regionizer = build_regionizer(data_cfg, ego_cfg)
@@ -376,13 +383,21 @@ def train(config: Dict) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train CVAE with policy action distributions")
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--data_root", type=str, help="Override data root")
+    parser.add_argument("--run_dir", type=str, help="Override run directory")
+    parser.add_argument("--data_cfg", type=str, help="Override data config path")
+    parser.add_argument("--ego_cfg", type=str, help="Override ego policy config path")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     config = load_config(Path(args.config))
-    train(config)
+    data_root = Path(args.data_root).expanduser() if args.data_root else None
+    run_dir = Path(args.run_dir).expanduser() if args.run_dir else None
+    data_cfg = Path(args.data_cfg).expanduser() if args.data_cfg else None
+    ego_cfg = Path(args.ego_cfg).expanduser() if args.ego_cfg else None
+    train(config, data_root=data_root, run_dir=run_dir, data_cfg_path=data_cfg, ego_cfg_path=ego_cfg)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
+from typing import List
 from shutil import copyfile
 import sys
 
@@ -54,11 +55,13 @@ def write_split(output_root: Path, split: str, windows, shuffled_actions, oppone
         )
 
 
-def main(source: Path, target: Path) -> None:
-    configure_logging()
-    rng = np.random.default_rng(17)
-    source = resolve_path(source)
-    target = resolve_path(target)
+def iter_policies(base: Path, policies: list[str] | None) -> List[Path]:
+    if policies:
+        return [base / name for name in policies]
+    return [p for p in sorted(base.iterdir()) if p.is_dir()]
+
+
+def shuffle_dataset(source: Path, target: Path, rng: np.random.Generator) -> None:
     indexer = EpisodeIndexer.load(source)
     target.mkdir(parents=True, exist_ok=True)
     new_indexer = EpisodeIndexer(root=target)
@@ -68,7 +71,7 @@ def main(source: Path, target: Path) -> None:
         actions = []
         opponents = []
         positions = []
-        policies = []
+        policy_ids = []
         for record in records:
             path = source / record.path
             with np.load(path, allow_pickle=False) as data:
@@ -76,8 +79,8 @@ def main(source: Path, target: Path) -> None:
                 actions.append(data["ego_actions"])
                 opponents.append(data["opponent_actions"])
                 positions.append(data["positions"])
-                policy = data["policy_id"] if "policy_id" in data else "baseline"
-                policies.append(policy.item() if hasattr(policy, "item") else policy)
+                policy = data["policy_id"] if "policy_id" in data else source.parent.name
+                policy_ids.append(policy.item() if hasattr(policy, "item") else policy)
         concatenated = np.concatenate([a.reshape(a.shape[0], -1) for a in actions], axis=0)
         perm = rng.permutation(concatenated.shape[0])
         shuffled_flat = concatenated[perm]
@@ -88,25 +91,42 @@ def main(source: Path, target: Path) -> None:
             chunk = shuffled_flat[pointer:pointer + count]
             shuffled_actions.append(chunk.reshape(act.shape))
             pointer += count
-        write_split(target, split, windows, shuffled_actions, opponents, positions, policies)
+        write_split(target, split, windows, shuffled_actions, opponents, positions, policy_ids)
         for idx, record in enumerate(records):
             path = target / split / f"episode_{idx:05d}.npz"
-            new_indexer.add_episode(split, path, length=actions[idx].shape[0], policy_id=policies[idx])
+            new_indexer.add_episode(split, path, length=actions[idx].shape[0], policy_id=policy_ids[idx])
         LOGGER.info("Shuffled split %s", split)
     new_indexer.save()
     baseline = source / "baseline_stats.npz"
     if baseline.exists():
-        copyfile(baseline, target / "baseline_stats.npz")
-    LOGGER.info("Shuffled dataset written to %s", target)
+        stats = np.load(baseline, allow_pickle=False)
+        np.savez_compressed(target / "baseline_stats.npz", **{k: stats[k] for k in stats.files})
+
+
+def main(base: Path, dataset: str, target: str, policies: list[str] | None) -> None:
+    configure_logging()
+    rng = np.random.default_rng(17)
+    base = resolve_path(base)
+    for policy_root in iter_policies(base, policies):
+        source = policy_root / dataset
+        if not source.exists():
+            LOGGER.warning("Skipping %s (missing %s)", policy_root.name, dataset)
+            continue
+        target_root = policy_root / target
+        LOGGER.info("Shuffling dataset %s -> %s", source, target_root)
+        shuffle_dataset(source, target_root, rng)
+        LOGGER.info("Shuffled dataset written to %s", target_root)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Shuffle dataset actions across samples")
-    parser.add_argument("--source", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
-    parser.add_argument("--target", type=str, default=str((PACKAGE_ROOT / "../output/data/iid_bad_shuffle").resolve()))
+    parser.add_argument("--base", type=str, default=str((PACKAGE_ROOT / "../output/data").resolve()))
+    parser.add_argument("--dataset", type=str, default="iid")
+    parser.add_argument("--target", type=str, default="iid_bad_shuffle")
+    parser.add_argument("--policy", action="append", help="Specific policy directories to process")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(Path(args.source), Path(args.target))
+    main(Path(args.base), args.dataset, args.target, args.policy)

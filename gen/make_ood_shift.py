@@ -1,11 +1,11 @@
-"""Generate OOD datasets by swapping in tuned opponent policies."""
+"""Generate OOD datasets for every ego policy configuration."""
 from __future__ import annotations
 
 import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List
 import sys
 
 import numpy as np
@@ -14,11 +14,10 @@ import yaml
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
+CFG_DIR = PACKAGE_ROOT / "cfg"
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-def resolve_path(path: Path) -> Path:
-    return path if path.is_absolute() else (REPO_ROOT / path)
 
 from policyOrProxy.core.dataset.indexer import EpisodeIndexer
 from policyOrProxy.core.metrics.metrics import wasserstein_distance_numpy
@@ -35,9 +34,26 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
 
+def resolve_path(path: Path) -> Path:
+    return path if path.is_absolute() else (REPO_ROOT / path)
+
+
 def load_yaml(path: Path) -> Dict:
     with resolve_path(path).open("r", encoding="utf-8") as fp:
         return yaml.safe_load(fp)
+
+
+def policy_name_from_path(path: Path) -> str:
+    return path.stem
+
+
+def find_ego_configs(explicit: List[str] | None) -> List[Path]:
+    if explicit:
+        return [resolve_path(Path(p)) for p in explicit]
+    configs = sorted(CFG_DIR.glob("ego_policy*.yaml"))
+    if not configs:
+        raise FileNotFoundError("No ego_policy*.yaml configs found")
+    return configs
 
 
 def build_ego_policy(arena, world_cfg: Dict, ego_cfg: Dict, rng: np.random.Generator) -> WindowHashPolicy:
@@ -74,29 +90,42 @@ def write_episode(root: Path, shift: str, split: str, episode_id: int, rollout: 
     return path
 
 
-def main(data_cfg: Path, ego_cfg: Path, shift_cfg: Path, opponents_dir: Path, opponent_cfg: Path) -> None:
-    configure_logging()
-    data_config = load_yaml(data_cfg)
-    ego_config = load_yaml(ego_cfg)
-    shift_config = load_yaml(shift_cfg)
-    opponent_config = load_yaml(opponent_cfg)
+def generate_policy_ood(
+    policy_cfg_path: Path,
+    data_config: Dict,
+    shift_config: Dict,
+    opponent_config: Dict,
+    opponents_root: Path,
+) -> None:
+    name = policy_name_from_path(policy_cfg_path)
+    ego_config = load_yaml(policy_cfg_path)
     rng = np.random.default_rng(13)
+
     arena = build_arena(data_config["arena"])
     world = build_world(arena, data_config["world"], rng)
     ego_policy = build_ego_policy(arena, data_config["world"], ego_config, rng)
-    baseline_root = resolve_path(Path(data_config.get("output_root", "output/data/iid")))
+
+    base_output = resolve_path(Path(data_config.get("output_root", "output/data")))
+    policy_root = base_output / name
+    baseline_root = policy_root / "iid"
+    if not baseline_root.exists():
+        raise FileNotFoundError(f"Missing baseline dataset for {name} at {baseline_root}")
     baseline_stats = np.load(baseline_root / "baseline_stats.npz", allow_pickle=False)
-    target_root = baseline_root.parent / "ood"
+    target_root = policy_root / "ood"
     target_root.mkdir(parents=True, exist_ok=True)
+
+    policy_opponents = opponents_root / name
+    if not policy_opponents.exists():
+        raise FileNotFoundError(f"Missing opponents for {name} at {policy_opponents}")
+
     divergence_report = {}
-    opponents_dir = resolve_path(opponents_dir)
     for shift_name, spec in shift_config["shifts"].items():
-        LOGGER.info("Generating OOD split %s", shift_name)
-        ckpt_path = opponents_dir / f"{shift_name}.pt"
+        LOGGER.info("[%s] Generating OOD split %s", name, shift_name)
+        ckpt_path = policy_opponents / f"{shift_name}.pt"
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Missing opponent checkpoint {ckpt_path}")
         opponent = WindowNN(
-            window_len=int(opponent_config.get("window_len", data_config["world"]["history"])),
+            window_len=int(opponent_config.get("window_len", data_config["world"].get("history", 1))),
             teams=int(data_config["world"]["teams"]),
             agents=int(data_config["world"]["agents_per_team"]),
             state_dim=int(opponent_config.get("state_dim", 4)),
@@ -107,19 +136,25 @@ def main(data_cfg: Path, ego_cfg: Path, shift_cfg: Path, opponents_dir: Path, op
             dropout=float(opponent_config.get("dropout", 0.1)),
             max_speed=float(opponent_config.get("max_speed", data_config["world"]["max_speed"])),
             activation=opponent_config.get("activation", "gelu"),
-            identifier=shift_name,
+            identifier=f"{name}_{shift_name}",
         )
         state_dict = torch.load(ckpt_path, map_location="cpu")
         opponent.load_state_dict(state_dict)
         indexer = EpisodeIndexer(root=target_root / shift_name)
-        states = []
-        actions = []
+        states: List[np.ndarray] = []
+        actions: List[np.ndarray] = []
         for split, count in data_config["rollout"]["episodes"].items():
             for episode_idx in range(int(count)):
                 world.reset()
-                rollout = world.rollout(ego_policy, opponent, steps=int(data_config["rollout"]["steps"]), deterministic=False, policy_id=shift_name)
+                rollout = world.rollout(
+                    ego_policy,
+                    opponent,
+                    steps=int(data_config["rollout"]["steps"]),
+                    deterministic=False,
+                    policy_id=f"{name}_{shift_name}",
+                )
                 path = write_episode(target_root, shift_name, split, episode_idx, rollout)
-                indexer.add_episode(split, path, length=rollout["ego_actions"].shape[0], policy_id=shift_name)
+                indexer.add_episode(split, path, length=rollout["ego_actions"].shape[0], policy_id=f"{name}_{shift_name}")
                 states.append(rollout["windows"][:, -1].reshape(rollout["windows"].shape[0], -1))
                 actions.append(rollout["ego_actions"].reshape(rollout["ego_actions"].shape[0], -1))
         indexer.save()
@@ -135,19 +170,30 @@ def main(data_cfg: Path, ego_cfg: Path, shift_cfg: Path, opponents_dir: Path, op
         }
     with (target_root / "divergence_report.json").open("w", encoding="utf-8") as fp:
         json.dump(divergence_report, fp, indent=2)
-    LOGGER.info("OOD dataset generation complete. Reports saved to %s", target_root / "divergence_report.json")
+    LOGGER.info("[%s] OOD dataset generation complete", name)
+
+
+def main(data_cfg: Path, opponent_cfg: Path, shift_cfg: Path, opponents_dir: Path, ego_cfgs: List[str] | None) -> None:
+    configure_logging()
+    data_config = load_yaml(data_cfg)
+    opponent_config = load_yaml(opponent_cfg)
+    shift_config = load_yaml(shift_cfg)
+    opponents_root = resolve_path(opponents_dir)
+    configs = find_ego_configs(ego_cfgs)
+    for cfg_path in configs:
+        generate_policy_ood(cfg_path, data_config, shift_config, opponent_config, opponents_root)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate OOD datasets")
     parser.add_argument("--data", type=str, default=str(PACKAGE_ROOT / "cfg" / "data.yaml"))
-    parser.add_argument("--ego", type=str, default=str(PACKAGE_ROOT / "cfg" / "ego_policy.yaml"))
+    parser.add_argument("--opponent_cfg", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy.yaml"))
     parser.add_argument("--shift", type=str, default=str(PACKAGE_ROOT / "cfg" / "shift.yaml"))
     parser.add_argument("--opponents", type=str, default=str((PACKAGE_ROOT / "../output/opponents").resolve()))
-    parser.add_argument("--opponent_cfg", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy.yaml"))
+    parser.add_argument("--ego", action="append", help="Specific ego policy configs")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(Path(args.data), Path(args.ego), Path(args.shift), Path(args.opponents), Path(args.opponent_cfg))
+    main(Path(args.data), Path(args.opponent_cfg), Path(args.shift), Path(args.opponents), args.ego)

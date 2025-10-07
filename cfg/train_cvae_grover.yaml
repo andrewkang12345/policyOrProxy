@@ -1,0 +1,13 @@
+batch_size: 8
+device: auto
+epochs: 50
+model:
+  decoder_hidden: 256
+  embed_dim: 64
+  hidden_dim: 256
+optimizer:
+  lr: 0.001
+seed: 23
+steps_per_epoch: 200
+triplet_margin: 1.0
+triplet_weight: 1.0

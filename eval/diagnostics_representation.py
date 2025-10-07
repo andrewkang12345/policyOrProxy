@@ -202,8 +202,8 @@ def run_grover_diagnostics(model_cfg: Dict, checkpoint: Path, eval_cfg: Dict, ou
     for distribution, spec in dataset_specs.items():
         for entry in _normalize_spec(spec):
             dataset_path = Path(entry["path"])
-            label = entry.get("label")
-            tag = f"{distribution}:{label}" if label else distribution
+            label = entry.get("label") or Path(entry["path"]).name
+            tag = f"{distribution}:{label}"
             indexer_eval = EpisodeIndexer.load(dataset_path)
             policies = load_episodes(dataset_path, indexer_eval, split=split_name, device=device)
             for policy_name, episodes in policies.items():
@@ -251,18 +251,40 @@ def run_grover_diagnostics(model_cfg: Dict, checkpoint: Path, eval_cfg: Dict, ou
     LOGGER.info("Representation diagnostics saved to %s", output)
 
 
-def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path: Path, output: Path) -> None:
+def main(args) -> None:
     configure_logging()
-    model_cfg = load_yaml(model_cfg_path)
-    eval_cfg = load_yaml(eval_cfg_path)
+    model_cfg = load_yaml(Path(args.config))
+    eval_cfg = load_yaml(Path(args.eval))
+    if args.data_root:
+        model_cfg.setdefault("paths", {})["data_root"] = args.data_root
+    if args.run_dir:
+        model_cfg.setdefault("paths", {})["run_dir"] = args.run_dir
+    if args.data_cfg:
+        model_cfg["data_config"] = args.data_cfg
+    if args.ego_cfg:
+        model_cfg["ego_policy"] = args.ego_cfg
+    if args.train_root:
+        model_cfg.setdefault("paths", {})["train_root"] = args.train_root
+    if args.dataset:
+        datasets = eval_cfg.setdefault("datasets", {})
+        datasets.clear()
+        for entry in args.dataset:
+            if "=" not in entry:
+                raise ValueError("Dataset entries must be of the form distribution=path or distribution=path:label")
+            dist, remainder = entry.split("=", 1)
+            if ":" in remainder:
+                path_str, label = remainder.split(":", 1)
+            else:
+                path_str, label = remainder, None
+            datasets.setdefault(dist, []).append({"path": path_str, "label": label})
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, latent_key, extras = build_feature_model(model_type, model_cfg, device)
+    model, latent_key, extras = build_feature_model(args.model_type, model_cfg, device)
 
     if model_type == "grover":
         run_grover_diagnostics(model_cfg, checkpoint, eval_cfg, output, device)
         return
 
-    ckpt = torch.load(checkpoint, map_location=device)
+    ckpt = torch.load(Path(args.checkpoint), map_location=device)
 
     # Unwrap common checkpoint formats
     if isinstance(ckpt, dict):
@@ -308,7 +330,8 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
         data_cfg = load_yaml(Path(extras["data_config"]))
         ego_cfg = load_yaml(Path(extras["ego_policy"]))
         regionizer = build_regionizer(data_cfg, ego_cfg)
-        base_root = Path(model_cfg["paths"]["data_root"]).expanduser()
+        paths_cfg = model_cfg.get("paths", {})
+        base_root = Path(paths_cfg.get("train_root", paths_cfg.get("data_root", "output/data"))).expanduser()
         base_indexer = EpisodeIndexer.load(base_root)
         train_dataset = NextFrameDataset(base_root, base_indexer, split="train", include_policy_id=False)
         bank = build_action_bank(train_dataset, regionizer)
@@ -333,15 +356,14 @@ def main(model_type: str, model_cfg_path: Path, checkpoint: Path, eval_cfg_path:
     for distribution, spec in dataset_specs.items():
         for entry in _normalize_spec(spec):
             dataset_path = Path(entry["path"])
-            label = entry.get("label")
-            tag = f"{distribution}:{label}" if label else distribution
+            label = entry.get("label") or Path(entry["path"]).name
+            tag = f"{distribution}:{label}"
             indexer = EpisodeIndexer.load(dataset_path)
             dataset = NextFrameDataset(
                 dataset_path,
                 indexer,
                 split=split_name,
                 include_policy_id=True,
-                window_len=int(model_cfg["window_len"]),  # align eval window with model
             )
             loader = DataLoader(
                 dataset,
@@ -405,11 +427,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model_type", choices=["global", "hier", "mapd", "grover"], required=True)
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--checkpoint", type=str, required=True)
-    parser.add_argument("--eval", type=str, default="policyOrProxy/cfg/eval.yaml")
+    parser.add_argument("--eval", type=str, default="policyOrProxy/cfg/eval_representation.yaml")
     parser.add_argument("--output", type=str, default="output/eval/representation.json")
+    parser.add_argument("--dataset", action="append", help="Dataset entry distribution=path[:label]")
+    parser.add_argument("--data_root", type=str, help="Override model data root")
+    parser.add_argument("--run_dir", type=str, help="Override run directory")
+    parser.add_argument("--data_cfg", type=str, help="Override data config path")
+    parser.add_argument("--ego_cfg", type=str, help="Override ego policy config path")
+    parser.add_argument("--train_root", type=str, help="Dataset used for auxiliary components (e.g. MAPD bank)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args.model_type, Path(args.config), Path(args.checkpoint), Path(args.eval), Path(args.output))
+    arguments = parse_args()
+    main(arguments)

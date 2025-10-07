@@ -219,7 +219,10 @@ def run_evaluation(model_type: str, model_cfg: Dict, ckpt: Path, eval_cfg: Dict,
         metrics, embeddings = evaluate_split(model, loader, device, arena, dt, forward, latent_key)
         results[tag] = metrics
         invariance_features[tag] = embeddings
-    baseline_root = Path(eval_cfg["datasets"]["baseline"])
+    baseline_path = eval_cfg.get("datasets", {}).get("baseline")
+    if not baseline_path:
+        raise ValueError("Evaluation config must provide a baseline dataset path (use --baseline)")
+    baseline_root = Path(baseline_path)
     evaluate_root(baseline_root, "baseline")
     for tag, path in eval_cfg["datasets"].get("ood_splits", {}).items():
         evaluate_root(Path(path), tag)
@@ -229,16 +232,38 @@ def run_evaluation(model_type: str, model_cfg: Dict, ckpt: Path, eval_cfg: Dict,
     return results
 
 
-def main(model_type: str, model_config_path: Path, checkpoint: Path, eval_config_path: Path, data_config_path: Path, output: Path) -> None:
+def main(args) -> None:
     configure_logging()
-    model_cfg = load_yaml(model_config_path)
-    eval_cfg = load_yaml(eval_config_path)
-    data_cfg = load_yaml(data_config_path)
-    results = run_evaluation(model_type, model_cfg, checkpoint, eval_cfg, data_cfg)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", encoding="utf-8") as fp:
+    model_cfg = load_yaml(Path(args.config))
+    eval_cfg = load_yaml(Path(args.eval))
+    data_cfg = load_yaml(Path(args.data))
+
+    if args.data_root:
+        model_cfg.setdefault("paths", {})["data_root"] = args.data_root
+    if args.run_dir:
+        model_cfg.setdefault("paths", {})["run_dir"] = args.run_dir
+    if args.train_root:
+        model_cfg.setdefault("paths", {})["train_root"] = args.train_root
+    if args.data_cfg:
+        model_cfg["data_config"] = args.data_cfg
+    if args.ego_cfg:
+        model_cfg["ego_policy"] = args.ego_cfg
+    if args.baseline:
+        eval_cfg.setdefault("datasets", {})["baseline"] = args.baseline
+    if args.ood:
+        ood_dict = eval_cfg.setdefault("datasets", {}).setdefault("ood_splits", {})
+        for entry in args.ood:
+            if "=" not in entry:
+                raise ValueError("OOD entries must be of the form tag=path")
+            tag, path = entry.split("=", 1)
+            ood_dict[tag] = path
+
+    results = run_evaluation(args.model_type, model_cfg, Path(args.checkpoint), eval_cfg, data_cfg)
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fp:
         json.dump(results, fp, indent=2)
-    LOGGER.info("Evaluation results stored in %s", output)
+    LOGGER.info("Evaluation results stored in %s", output_path)
 
 
 def parse_args() -> argparse.Namespace:
@@ -249,9 +274,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eval", type=str, default="policyOrProxy/cfg/eval.yaml")
     parser.add_argument("--data", type=str, default="policyOrProxy/cfg/data.yaml")
     parser.add_argument("--output", type=str, default="output/eval/results.json")
+    parser.add_argument("--baseline", type=str, help="Override baseline dataset path")
+    parser.add_argument("--ood", action="append", help="Add OOD split in the form tag=path")
+    parser.add_argument("--data_root", type=str, help="Override model data root")
+    parser.add_argument("--run_dir", type=str, help="Override run directory")
+    parser.add_argument("--train_root", type=str, help="Dataset used for auxiliary components (e.g. MAPD bank)")
+    parser.add_argument("--data_cfg", type=str, help="Override data config path")
+    parser.add_argument("--ego_cfg", type=str, help="Override ego policy config path")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args.model_type, Path(args.config), Path(args.checkpoint), Path(args.eval), Path(args.data), Path(args.output))
+    arguments = parse_args()
+    main(arguments)

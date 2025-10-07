@@ -1,11 +1,11 @@
-"""Generate IID baseline dataset using ego hash policy against neutral opponent."""
+"""Generate IID baselines for every available ego policy configuration."""
 from __future__ import annotations
 
 import argparse
 import logging
 from pathlib import Path
+from typing import Dict, Iterable, List
 import sys
-from typing import Dict
 
 import numpy as np
 import torch
@@ -13,11 +13,11 @@ import yaml
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
+CFG_DIR = PACKAGE_ROOT / "cfg"
+EGO_PATTERN = "ego_policy*.yaml"
+
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-def resolve_path(path: Path) -> Path:
-    return path if path.is_absolute() else (REPO_ROOT / path)
 
 from policyOrProxy.core.dataset.indexer import EpisodeIndexer
 from policyOrProxy.core.policies.egoPolicy import WindowHashPolicy
@@ -33,12 +33,35 @@ def configure_logging() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
 
 
+def resolve_path(path: Path) -> Path:
+    return path if path.is_absolute() else (REPO_ROOT / path)
+
+
 def load_yaml(path: Path) -> Dict:
     with resolve_path(path).open("r", encoding="utf-8") as fp:
         return yaml.safe_load(fp)
 
 
-def build_policies(arena_cfg: Dict, ego_cfg: Dict, opp_cfg: Dict, world_cfg: Dict, rng: np.random.Generator):
+def find_ego_configs(explicit: Iterable[str] | None = None) -> List[Path]:
+    if explicit:
+        return [resolve_path(Path(p)) for p in explicit]
+    configs = sorted(CFG_DIR.glob(EGO_PATTERN))
+    if not configs:
+        raise FileNotFoundError(f"No ego policy configs matching {EGO_PATTERN}")
+    return configs
+
+
+def policy_name_from_path(path: Path) -> str:
+    return path.stem  # e.g. ego_policy1
+
+
+def build_policies(
+    arena_cfg: Dict,
+    ego_cfg: Dict,
+    opp_cfg: Dict,
+    world_cfg: Dict,
+    rng: np.random.Generator,
+) -> tuple:
     arena = build_arena(arena_cfg)
     world = build_world(arena, world_cfg, rng=rng)
     regionizer = WindowHashRegionizer(
@@ -89,27 +112,45 @@ def write_episode(root: Path, split: str, episode_id: int, rollout: Dict[str, np
     return path
 
 
-def main(data_cfg: Path, ego_cfg: Path, opp_cfg: Path) -> None:
-    configure_logging()
-    data_config = load_yaml(data_cfg)
-    ego_config = load_yaml(ego_cfg)
-    opp_config = load_yaml(opp_cfg)
-    rng = np.random.default_rng(int(data_config["rollout"].get("seed", 0)))
-    arena, world, ego_policy, opp_policy = build_policies(data_config["arena"], ego_config, opp_config, data_config["world"], rng)
-    rollout_cfg = data_config["rollout"]
-    episodes_cfg = rollout_cfg["episodes"]
-    output_root = resolve_path(Path(data_config.get("output_root", "output/data/iid")))
+def generate_for_policy(
+    policy_config: Path,
+    data_cfg: Dict,
+    opp_cfg: Dict,
+) -> None:
+    policy_cfg = load_yaml(policy_config)
+    name = policy_name_from_path(policy_config)
+    output_root = resolve_path(Path(data_cfg.get("output_root", "output/data"))) / name / "iid"
     output_root.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(int(data_cfg["rollout"].get("seed", 0)))
+    arena, world, ego_policy, opp_policy = build_policies(
+        data_cfg["arena"],
+        policy_cfg,
+        opp_cfg,
+        data_cfg["world"],
+        rng,
+    )
+
+    rollout_cfg = data_cfg["rollout"]
+    episodes_cfg = rollout_cfg["episodes"]
     indexer = EpisodeIndexer(root=output_root)
     baseline_states = []
     baseline_actions = []
+    policy_id = name
+
+    LOGGER.info("Generating IID data for %s into %s", name, output_root)
     for split, count in episodes_cfg.items():
-        LOGGER.info("Generating %d episodes for split %s", count, split)
         for episode_idx in range(int(count)):
             world.reset()
-            rollout = world.rollout(ego_policy, opp_policy, steps=int(rollout_cfg["steps"]), deterministic=False, policy_id="baseline")
+            rollout = world.rollout(
+                ego_policy,
+                opp_policy,
+                steps=int(rollout_cfg["steps"]),
+                deterministic=False,
+                policy_id=policy_id,
+            )
             path = write_episode(output_root, split, episode_idx, rollout)
-            indexer.add_episode(split, path, length=rollout["ego_actions"].shape[0], policy_id="baseline")
+            indexer.add_episode(split, path, length=rollout["ego_actions"].shape[0], policy_id=policy_id)
             final_states = rollout["windows"][:, -1].reshape(rollout["windows"].shape[0], -1)
             baseline_states.append(final_states)
             baseline_actions.append(rollout["ego_actions"].reshape(rollout["ego_actions"].shape[0], -1))
@@ -117,19 +158,28 @@ def main(data_cfg: Path, ego_cfg: Path, opp_cfg: Path) -> None:
     states = np.concatenate(baseline_states, axis=0)
     actions = np.concatenate(baseline_actions, axis=0)
     sample_size = min(5000, states.shape[0])
-    sample_indices = rng.choice(states.shape[0], size=sample_size, replace=False)
+    sample_indices = np.random.default_rng().choice(states.shape[0], size=sample_size, replace=False)
     np.savez_compressed(output_root / "baseline_stats.npz", states=states[sample_indices], actions=actions[sample_indices])
-    LOGGER.info("Dataset generation complete. Baseline stats saved to %s", output_root / "baseline_stats.npz")
+    LOGGER.info("Finished %s", name)
+
+
+def main(data_cfg: Path, opponent_cfg: Path, ego_cfgs: List[str]) -> None:
+    configure_logging()
+    data_config = load_yaml(data_cfg)
+    opp_config = load_yaml(opponent_cfg)
+    configs = find_ego_configs(ego_cfgs)
+    for cfg in configs:
+        generate_for_policy(cfg, data_config, opp_config)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate IID baseline dataset")
+    parser = argparse.ArgumentParser(description="Generate IID baselines for all ego policies")
     parser.add_argument("--data", type=str, default=str(PACKAGE_ROOT / "cfg" / "data.yaml"))
-    parser.add_argument("--ego", type=str, default=str(PACKAGE_ROOT / "cfg" / "ego_policy.yaml"))
     parser.add_argument("--opponent", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy.yaml"))
+    parser.add_argument("--ego", action="append", help="Specific ego policy yaml(s) to use (defaults to all ego_policy*.yaml)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    main(Path(args.data), Path(args.ego), Path(args.opponent))
+    main(Path(args.data), Path(args.opponent), args.ego or [])
