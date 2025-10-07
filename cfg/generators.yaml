@@ -1,18 +1,91 @@
+# generators.yaml
 seed: 0
+
 shifts:
-  mild_gauss:
-    state_wasserstein: 0.4
-    action_wasserstein: 0.3
-    seed: 21
+  # 1️⃣ Very small bias — essentially sanity-check level
+  right_bias_tiny:
+    state_wasserstein: 2.8
+    action_wasserstein: 0.0
+    seed: 11
     generator:
-      type: gaussian_shift
+      type: resample_weighted
       params:
-        center: arena
-        base_sigma: 0.02           
-        base_sigma_relative: true
-        mean_dir: [1.0, 0.0]
-        vel_mode: zero
+        feature: mean_x
+        candidate_stride: 1
+        alpha_max: 30.0
     window_noise:
-      pos_std: 0.005                  
+      pos_std: 0.0
+      vel_std: 0.0
+      rho: 0.0
+
+  # 2️⃣ Mild right bias — visible but still realistic
+  right_bias_mild:
+    state_wasserstein: 3.2
+    action_wasserstein: 0.0
+    seed: 12
+    generator:
+      type: resample_weighted
+      params:
+        feature: mean_x
+        candidate_stride: 1
+        alpha_max: 50.0
+    window_noise:
+      pos_std: 0.002
       vel_std: 0.0
       rho: 0.5
+
+  # 3️⃣ Moderate right bias — agents clearly shifted
+  right_bias_moderate:
+    state_wasserstein: 3.6
+    action_wasserstein: 0.0
+    seed: 13
+    generator:
+      type: resample_weighted
+      params:
+        feature: mean_x
+        candidate_stride: 1
+        alpha_max: 75.0
+    window_noise:
+      pos_std: 0.003
+      vel_std: 0.0
+      rho: 0.7
+
+  # 4️⃣ Strong right bias — quite concentrated near arena right edge
+  right_bias_strong:
+    state_wasserstein: 4.0
+    action_wasserstein: 0.0
+    seed: 14
+    generator:
+      type: resample_weighted
+      params:
+        feature: mean_x
+        candidate_stride: 1
+        alpha_max: 100.0
+    window_noise:
+      pos_std: 0.004
+      vel_std: 0.0
+      rho: 0.7
+      drift:
+        dx: 0.0005      # consistent drift rightward per timestep
+        dy: 0.0
+        relative: false
+
+  # 5️⃣ Extreme right bias — density collapse near far right
+  right_bias_extreme:
+    state_wasserstein: 4.5
+    action_wasserstein: 0.0
+    seed: 15
+    generator:
+      type: resample_weighted
+      params:
+        feature: mean_x
+        candidate_stride: 1
+        alpha_max: 150.0
+    window_noise:
+      pos_std: 0.005
+      vel_std: 0.0
+      rho: 0.8
+      drift:
+        dx: 0.001
+        dy: 0.0
+        relative: false
