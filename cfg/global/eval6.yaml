@@ -2,14 +2,14 @@ model_type: global          # or hier | mapd
 device: auto                # or "cpu"
 batch_size: 128
 num_workers: 4
-output: output/eval/experiment1.json
+output: output/eval/global/experiment6.json
 data:
   experiment:
     test:
       # Mix and match whatever you want:
       # 1) explicit paths:
-      - {path: "output/data/ego_policy1/iid"}
-      - {path: "output/data/ego_policy2/iid"}
+      - {path: "output/data/ood_manual/ego_policy1/right_bias_mild"}
+      - {path: "output/data/ood_manual/ego_policy2/right_bias_mild"}
       # - {path: "output/data/ood_manual/ego_policy2/right_bias_moderate"}
       # 2) or policy + category (supports globs in 'policy'):
       # - {policy: "ego_policy*", category: "iid"}

@@ -54,6 +54,26 @@ class World:
         self._history.clear()
         self._history_extend(self.state)
 
+    # reset to an arbitrary multi-agent state [teams, agents, F]
+    def reset_to(self, start_state: np.ndarray) -> None:
+        """
+        start_state[..., :2] = positions
+        start_state[..., 2:4] (optional) = velocities; if absent -> zeros.
+        """
+        start_state = np.asarray(start_state, dtype=np.float32)
+        assert start_state.shape[0] == self.config.teams and start_state.shape[1] == self.config.agents_per_team, \
+            f"Start state shape mismatch: {start_state.shape} vs (teams={self.config.teams}, agents={self.config.agents_per_team})"
+        pos = start_state[..., :2]
+        vel = start_state[..., 2:4] if start_state.shape[-1] >= 4 else np.zeros_like(pos, dtype=np.float32)
+        pos = self.arena.clamp_positions(pos)
+        self.state = WorldState(positions=pos.astype(np.float32), velocities=vel.astype(np.float32))
+        self._history.clear()
+        self._history_extend(self.state)
+
+    # Optional alias some code might look for
+    def set_state(self, start_state: np.ndarray) -> None:
+        self.reset_to(start_state)
+
     def _history_extend(self, state: WorldState) -> None:
         while len(self._history) < self.config.history:
             self._history.append(state)
@@ -68,6 +88,7 @@ class World:
         return stacked
 
     def step(self, actions: np.ndarray) -> None:
+        # actions shape: (teams, agents, 2)
         assert actions.shape == (self.config.teams, self.config.agents_per_team, 2), "invalid action shape"
         clipped = np.clip(actions, -1.0, 1.0) * self.config.max_speed
         noise = self.rng.normal(scale=self.config.perturbation_std, size=clipped.shape)

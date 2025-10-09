@@ -1,0 +1,61 @@
+# ============================================
+# Configure Train/val distributions and policies
+# ============================================
+
+data:
+  experiment:
+    train:
+      # - {path: "output/data/ego_policy1/iid"}
+      # - {path: "output/data/ood_manual/ego_policy2/right_bias_mild"}
+      - {path: "output/data/ego_policy1/iid"}
+      - {path: "output/data/ego_policy2/iid"}
+
+    val:
+      # - {path: "output/data/ego_policy1/iid"}
+      # - {path: "output/data/ood_manual/ego_policy2/right_bias_mild"}      
+      - {path: "output/data/ego_policy1/iid"}
+      - {path: "output/data/ego_policy2/iid"}
+
+seed: 17
+device: auto
+prefer_free_gpu: true
+
+window_len: 6
+epochs: 20
+batch_size: 64
+num_workers: 4
+latent_dim: 32
+validate_interval: 2000
+max_grad_norm: 5.0
+
+optimizer:
+  lr: 0.0003
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+scheduler:
+  warmup_steps: 2000
+  min_lr: 1.0e-5
+
+loss:
+  beta_kl: 0.0001
+  beta_schedule: none        # options: none | linear_warmup | cosine
+  beta_min: 0.0
+  beta_max: 1.0
+  beta_warmup_steps: 5000
+  beta_period_steps: 20000
+
+model:
+  encoder_dim: 256
+  encoder_layers: 4
+  encoder_heads: 4
+  dropout: 0.1
+  action_dim: 2
+  agents: 1
+  teams: 2
+  state_dim: 4
+  reconstruction_loss: smooth_l1
+
+paths:
+  data_root: output/data
+  run_dir: output/runs/global_cvae_experiment6

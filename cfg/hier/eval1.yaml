@@ -1,8 +1,8 @@
-model_type: global          # or hier | mapd
+model_type: hier          # or hier | mapd
 device: auto                # or "cpu"
 batch_size: 128
 num_workers: 4
-output: output/eval/experiment1.json
+output: output/eval/hier/experiment1.json
 data:
   experiment:
     test:

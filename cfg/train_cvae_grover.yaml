@@ -1,6 +1,6 @@
 batch_size: 8
 device: auto
-epochs: 50
+epochs: 20
 model:
   decoder_hidden: 256
   embed_dim: 64

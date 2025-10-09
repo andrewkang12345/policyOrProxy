@@ -2,7 +2,7 @@ model_type: global          # or hier | mapd
 device: auto                # or "cpu"
 batch_size: 128
 num_workers: 4
-output: output/eval/experiment1.json
+output: output/eval/global/experiment7.json
 data:
   experiment:
     test:
@@ -10,7 +10,9 @@ data:
       # 1) explicit paths:
       - {path: "output/data/ego_policy1/iid"}
       - {path: "output/data/ego_policy2/iid"}
-      # - {path: "output/data/ood_manual/ego_policy2/right_bias_moderate"}
+      - {path: "output/data/ego_policy3/iid"}
+      # - {path: "output/data/ood_manual/ego_policy1/right_bias_mild"}
+      # - {path: "output/data/ood_manual/ego_policy2/right_bias_mild"}
       # 2) or policy + category (supports globs in 'policy'):
       # - {policy: "ego_policy*", category: "iid"}
       # - {policy: "ego_policy3", category: "ood_manual+right_bias_mild"}
