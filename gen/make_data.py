@@ -8,7 +8,6 @@ from typing import Dict, Iterable, List
 import sys
 
 import numpy as np
-import torch
 import yaml
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -20,9 +19,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from policyOrProxy.core.dataset.indexer import EpisodeIndexer
-from policyOrProxy.core.policies.egoPolicy import WindowHashPolicy
-from policyOrProxy.core.policies.oppPolicy import WindowNN
-from policyOrProxy.core.regionizers.windowhash import WindowHashRegionizer
+from policyOrProxy.core.policies.egoPolicy import build_window_hash_policy
+from policyOrProxy.core.policies.oppPolicy import build_hash_policy
 from policyOrProxy.core.world.arena import build_arena
 from policyOrProxy.core.world.world import build_world
 
@@ -64,37 +62,14 @@ def build_policies(
 ) -> tuple:
     arena = build_arena(arena_cfg)
     world = build_world(arena, world_cfg, rng=rng)
-    regionizer = WindowHashRegionizer(
+    ego_policy = build_window_hash_policy(
         arena=arena,
-        num_buckets=int(ego_cfg["num_buckets"]),
-        grid_size=int(ego_cfg["quantization"]["grid_size"]),
-        length_scale=float(ego_cfg["quantization"].get("length_scale", 1.0)),
-        jitter=float(ego_cfg["quantization"].get("jitter", 0.0)),
+        world_cfg=world_cfg,
+        policy_cfg=ego_cfg,
+        identifier=ego_cfg.get("identifier", "ego_window_hash"),
     )
-    ego_policy = WindowHashPolicy(
-        regionizer=regionizer,
-        num_agents=world.config.agents_per_team,
-        num_prototypes=int(ego_cfg["num_prototypes"]),
-        max_speed=float(ego_cfg["prototype_init"].get("max_speed", world.config.max_speed)),
-        noise_std=float(ego_cfg.get("noise_std", 0.0)),
-        sampling=ego_cfg.get("sampling", "stochastic"),
-        seed=int(ego_cfg["prototype_init"].get("seed", 0)),
-    )
-    opp_policy = WindowNN(
-        window_len=int(opp_cfg["window_len"]),
-        teams=world.config.teams,
-        agents=world.config.agents_per_team,
-        state_dim=int(opp_cfg.get("state_dim", 4)),
-        hidden_dim=int(opp_cfg.get("hidden_dim", 256)),
-        layers=int(opp_cfg.get("layers", 3)),
-        heads=int(opp_cfg.get("heads", 4)),
-        dropout=float(opp_cfg.get("dropout", 0.1)),
-        arch=opp_cfg.get("arch", "mlp"),
-        activation=opp_cfg.get("activation", "gelu"),
-        max_speed=float(opp_cfg.get("max_speed", world.config.max_speed)),
-        identifier="baseline",
-    )
-    return arena, world, ego_policy, opp_policy
+    opponent_policy = build_hash_policy(arena, world_cfg, opp_cfg, seed_offset=1)
+    return arena, world, ego_policy, opponent_policy
 
 
 def write_episode(root: Path, split: str, episode_id: int, rollout: Dict[str, np.ndarray]) -> Path:
@@ -175,7 +150,7 @@ def main(data_cfg: Path, opponent_cfg: Path, ego_cfgs: List[str]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate IID baselines for all ego policies")
     parser.add_argument("--data", type=str, default=str(PACKAGE_ROOT / "cfg" / "data.yaml"))
-    parser.add_argument("--opponent", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy.yaml"))
+    parser.add_argument("--opponent", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy_hash.yaml"))
     parser.add_argument("--ego", action="append", help="Specific ego policy yaml(s) to use (defaults to all ego_policy*.yaml)")
     return parser.parse_args()
 

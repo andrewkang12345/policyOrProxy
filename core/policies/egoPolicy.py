@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 
@@ -21,13 +21,15 @@ class WindowHashPolicy:
     noise_std: float = 0.0
     sampling: str = "stochastic"
     seed: Optional[int] = None
+    identifier: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.rng = np.random.default_rng(self.seed)
         prototypes = self.rng.uniform(-1.0, 1.0, size=(self.regionizer.num_buckets, self.num_prototypes, self.num_agents, 2)).astype(np.float32)
         prototypes *= self.max_speed
         self.regionizer.register_prototypes(prototypes)
-        self.identifier = "ego_window_hash"
+        if not self.identifier:
+            self.identifier = "window_hash_policy"
         LOGGER.info("Initialized WindowHashPolicy with %d buckets", self.regionizer.num_buckets)
 
     def act(self, window: np.ndarray, deterministic: bool = False) -> np.ndarray:
@@ -64,3 +66,33 @@ class WindowHashPolicy:
         if state.get("weights") is not None:
             weights = np.asarray(state["weights"], dtype=np.float32)
         self.regionizer.register_prototypes(prototypes, weights)
+
+
+def build_window_hash_policy(
+    arena,
+    world_cfg: Dict,
+    policy_cfg: Dict,
+    *,
+    identifier: Optional[str] = None,
+    seed_offset: int = 0,
+) -> WindowHashPolicy:
+    quant_cfg = policy_cfg.get("quantization", {})
+    proto_cfg = policy_cfg.get("prototype_init", {})
+    regionizer = WindowHashRegionizer(
+        arena=arena,
+        num_buckets=int(policy_cfg["num_buckets"]),
+        grid_size=int(quant_cfg["grid_size"]),
+        length_scale=float(quant_cfg.get("length_scale", 1.0)),
+        jitter=float(quant_cfg.get("jitter", 0.0)),
+    )
+    seed = int(proto_cfg.get("seed", 0)) + int(seed_offset)
+    return WindowHashPolicy(
+        regionizer=regionizer,
+        num_agents=int(world_cfg["agents_per_team"]),
+        num_prototypes=int(policy_cfg["num_prototypes"]),
+        max_speed=float(proto_cfg.get("max_speed", world_cfg["max_speed"])),
+        noise_std=float(policy_cfg.get("noise_std", 0.0)),
+        sampling=policy_cfg.get("sampling", "stochastic"),
+        seed=seed,
+        identifier=identifier,
+    )

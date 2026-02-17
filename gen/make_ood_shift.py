@@ -9,7 +9,6 @@ from typing import Dict, List
 import sys
 
 import numpy as np
-import torch
 import yaml
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
@@ -21,9 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from policyOrProxy.core.dataset.indexer import EpisodeIndexer
 from policyOrProxy.core.metrics.metrics import wasserstein_distance_numpy
-from policyOrProxy.core.policies.egoPolicy import WindowHashPolicy
-from policyOrProxy.core.policies.oppPolicy import WindowNN
-from policyOrProxy.core.regionizers.windowhash import WindowHashRegionizer
+from policyOrProxy.core.policies.egoPolicy import WindowHashPolicy, build_window_hash_policy
+from policyOrProxy.core.policies.oppPolicy import build_hash_policy
 from policyOrProxy.core.world.arena import build_arena
 from policyOrProxy.core.world.world import build_world
 
@@ -56,22 +54,12 @@ def find_ego_configs(explicit: List[str] | None) -> List[Path]:
     return configs
 
 
-def build_ego_policy(arena, world_cfg: Dict, ego_cfg: Dict, rng: np.random.Generator) -> WindowHashPolicy:
-    regionizer = WindowHashRegionizer(
+def build_ego_policy(arena, world_cfg: Dict, ego_cfg: Dict) -> WindowHashPolicy:
+    return build_window_hash_policy(
         arena=arena,
-        num_buckets=int(ego_cfg["num_buckets"]),
-        grid_size=int(ego_cfg["quantization"]["grid_size"]),
-        length_scale=float(ego_cfg["quantization"].get("length_scale", 1.0)),
-        jitter=float(ego_cfg["quantization"].get("jitter", 0.0)),
-    )
-    return WindowHashPolicy(
-        regionizer=regionizer,
-        num_agents=int(world_cfg["agents_per_team"]),
-        num_prototypes=int(ego_cfg["num_prototypes"]),
-        max_speed=float(ego_cfg["prototype_init"].get("max_speed", world_cfg["max_speed"])),
-        noise_std=float(ego_cfg.get("noise_std", 0.0)),
-        sampling=ego_cfg.get("sampling", "stochastic"),
-        seed=int(ego_cfg["prototype_init"].get("seed", 0)),
+        world_cfg=world_cfg,
+        policy_cfg=ego_cfg,
+        identifier=ego_cfg.get("identifier", "ego_window_hash"),
     )
 
 
@@ -103,7 +91,7 @@ def generate_policy_ood(
 
     arena = build_arena(data_config["arena"])
     world = build_world(arena, data_config["world"], rng)
-    ego_policy = build_ego_policy(arena, data_config["world"], ego_config, rng)
+    ego_policy = build_ego_policy(arena, data_config["world"], ego_config)
 
     base_output = resolve_path(Path(data_config.get("output_root", "output/data")))
     policy_root = base_output / name
@@ -119,27 +107,24 @@ def generate_policy_ood(
         raise FileNotFoundError(f"Missing opponents for {name} at {policy_opponents}")
 
     divergence_report = {}
-    for shift_name, spec in shift_config["shifts"].items():
+    for shift_idx, (shift_name, spec) in enumerate(shift_config["shifts"].items(), start=1):
         LOGGER.info("[%s] Generating OOD split %s", name, shift_name)
-        ckpt_path = policy_opponents / f"{shift_name}.pt"
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"Missing opponent checkpoint {ckpt_path}")
-        opponent = WindowNN(
-            window_len=int(opponent_config.get("window_len", data_config["world"].get("history", 1))),
-            teams=int(data_config["world"]["teams"]),
-            agents=int(data_config["world"]["agents_per_team"]),
-            state_dim=int(opponent_config.get("state_dim", 4)),
-            hidden_dim=int(opponent_config.get("hidden_dim", 256)),
-            layers=int(opponent_config.get("layers", 3)),
-            heads=int(opponent_config.get("heads", 4)),
-            arch=opponent_config.get("arch", "mlp"),
-            dropout=float(opponent_config.get("dropout", 0.1)),
-            max_speed=float(opponent_config.get("max_speed", data_config["world"]["max_speed"])),
-            activation=opponent_config.get("activation", "gelu"),
+        ckpt_path = policy_opponents / f"{shift_name}.npz"
+        opponent = build_hash_policy(
+            arena=arena,
+            world_cfg=data_config["world"],
+            opp_cfg=opponent_config,
+            seed_offset=shift_idx,
             identifier=f"{name}_{shift_name}",
         )
-        state_dict = torch.load(ckpt_path, map_location="cpu")
-        opponent.load_state_dict(state_dict)
+        if ckpt_path.exists():
+            with np.load(ckpt_path, allow_pickle=False) as opponent_state:
+                state_payload = {"prototypes": opponent_state["prototypes"]}
+                if "weights" in opponent_state.files:
+                    state_payload["weights"] = opponent_state["weights"]
+            opponent.load_state(state_payload)
+        else:
+            LOGGER.warning("Missing opponent state at %s; using freshly initialized policy.", ckpt_path)
         indexer = EpisodeIndexer(root=target_root / shift_name)
         states: List[np.ndarray] = []
         actions: List[np.ndarray] = []
@@ -187,7 +172,7 @@ def main(data_cfg: Path, opponent_cfg: Path, shift_cfg: Path, opponents_dir: Pat
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate OOD datasets")
     parser.add_argument("--data", type=str, default=str(PACKAGE_ROOT / "cfg" / "data.yaml"))
-    parser.add_argument("--opponent_cfg", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy.yaml"))
+    parser.add_argument("--opponent_cfg", type=str, default=str(PACKAGE_ROOT / "cfg" / "opponent_policy_hash.yaml"))
     parser.add_argument("--shift", type=str, default=str(PACKAGE_ROOT / "cfg" / "shift.yaml"))
     parser.add_argument("--opponents", type=str, default=str((PACKAGE_ROOT / "../output/opponents").resolve()))
     parser.add_argument("--ego", action="append", help="Specific ego policy configs")

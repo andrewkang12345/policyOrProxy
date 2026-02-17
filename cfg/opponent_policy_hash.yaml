@@ -1,0 +1,11 @@
+num_buckets: 2048
+num_prototypes: 4
+noise_std: 0.0
+sampling: stochastic
+quantization:
+  grid_size: 32
+  jitter: 0.01
+  length_scale: 1.0
+prototype_init:
+  max_speed: 3.5
+  seed: 43

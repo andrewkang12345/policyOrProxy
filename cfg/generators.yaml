@@ -1,0 +1,18 @@
+seed: 0
+shifts:
+  mild_gauss:
+    state_wasserstein: 0.4
+    action_wasserstein: 0.3
+    seed: 21
+    generator:
+      type: gaussian_shift
+      params:
+        center: arena
+        base_sigma: 0.02           
+        base_sigma_relative: true
+        mean_dir: [1.0, 0.0]
+        vel_mode: zero
+    window_noise:
+      pos_std: 0.005                  
+      vel_std: 0.0
+      rho: 0.5
