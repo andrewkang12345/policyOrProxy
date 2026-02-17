@@ -1,36 +1,18 @@
 #!/usr/bin/env python3
 """
-Train a global latent CVAE across *selected policies* for configurable categories.
+Train a global latent CVAE across selected policies (Option B: single window length).
 
-Features:
-- Auto-discovers policy roots (iid or specific OOD shift)
-- Or uses explicit per-split experiment lists (train/val only; test is ignored here)
-- ConcatDataset over selected policies (keeps policy_id in batches)
-- beta-VAE (fixed or scheduled)
-- Resumable training (model/opt/sched/global_step/epoch/RNG)
-- CSV metrics + train.log
-- Picks emptiest CUDA device (no DataParallel)
+Option B semantics:
+- The authoritative temporal window length is the stored NPZ window dimension:
+    window = npz["windows"][t]            # shape (T, teams, agents, state_dim)
+    target = npz["ego_actions"][t]        # shape (agents, action_dim)
+- T is inferred from the TRAIN dataset and enforced consistent across all selected roots
+  (train/val both must match).
+- YAML key `window_len` is NOT used.
 
-YAML keys you can set (examples):
-  data:
-    category: "iid" | "ood_manual+right_bias_moderate"
-    # OR an explicit experiment split config (train/val only)
-    experiment:
-      train:
-        - {path: "output/data/ego_policy1/iid"}
-        - {policy: "ego_policy2", category: "ood_manual+right_bias_mild"}
-      val:
-        - {path: "output/data/ego_policy1/iid"}
-      # test: ...   <-- IGNORED by this script
-
-  loss:
-    beta_kl: 1.0
-    beta_schedule: none | linear_warmup | cosine
-    beta_min: 0.0
-    beta_max: 1.0
-    beta_warmup_steps: 5000
-    beta_period_steps: 20000
-  prefer_free_gpu: true
+IMPORTANT:
+This script assumes your NextFrameDataset returns aligned samples (windows[t], ego_actions[t])
+and exposes `.window_len` inferred from stored NPZ windows.
 """
 
 from __future__ import annotations
@@ -100,6 +82,21 @@ def pick_emptiest_cuda_device() -> Optional[int]:
 
 
 # ---------- data helpers ----------
+
+def infer_concat_window_len(ds: ConcatDataset) -> int:
+    if not hasattr(ds, "datasets") or not ds.datasets:
+        raise ValueError("ConcatDataset is empty; cannot infer window length.")
+    first = ds.datasets[0]
+    T = getattr(first, "window_len", None)
+    if T is None:
+        raise ValueError("Underlying dataset did not set window_len; cannot infer.")
+    for sub in ds.datasets[1:]:
+        if getattr(sub, "window_len", None) != T:
+            raise ValueError(
+                f"Mismatched window_len across datasets: {getattr(sub,'window_len',None)} vs {T}"
+            )
+    return int(T)
+
 
 def parse_category(cat: str) -> Tuple[str, Optional[str]]:
     """
@@ -175,6 +172,7 @@ def expand_experiment_entries(data_root: Path, split_entries: List[Dict]) -> Lis
             LOGGER.warning("Ignoring entry with 'policy' but no 'category': %s", ent)
             continue
         LOGGER.warning("Unrecognized split entry, ignored: %s", ent)
+
     # dedupe
     seen = set()
     uniq = []
@@ -218,21 +216,20 @@ def discover_policy_roots(data_root: Path, category: str) -> List[Path]:
 def build_concat_dataset(
     roots: List[Path],
     split: str,
-    window_len: int,
     device: Optional[torch.device] = None,
     include_policy_id: bool = True,
 ) -> Tuple[ConcatDataset, Dict[int, str]]:
     """
     For each policy root, load its EpisodeIndexer and wrap a NextFrameDataset.
     Concatenate them, and build a global (int_id -> policy_name) mapping.
+
+    Window length (T) is inferred from NPZ windows and enforced consistent.
     """
     datasets: List[NextFrameDataset] = []
     id_map: Dict[int, str] = {}
     next_id = 0
 
     for root in roots:
-        # policy name is parent of category dir:
-        #   .../ego_policyX/iid   or   .../ood_manual/ego_policyX/shift
         if root.name in ("iid", "train", "val", "test"):
             policy = root.parent.name
         else:
@@ -248,10 +245,9 @@ def build_concat_dataset(
             root=root,
             indexer=indexer,
             split=split,
-            device=None,                 # moved later in collate
+            device=device,               # can be None; move_batch handles later
             preload=False,
             include_policy_id=include_policy_id,
-            window_len=window_len,
         )
         id_map[next_id] = policy
         next_id += 1
@@ -377,7 +373,10 @@ class GlobalCVAE(nn.Module):
         logvar = outputs["logvar_action"]
         recon = 0.5 * ((actions - mean).pow(2) * torch.exp(-logvar) + logvar)
         recon = recon.sum(dim=[1, 2]).mean()
-        kl = -0.5 * torch.sum(1 + outputs["logvar_z"] - outputs["mu"].pow(2) - outputs["logvar_z"].exp(), dim=1).mean()
+        kl = -0.5 * torch.sum(
+            1 + outputs["logvar_z"] - outputs["mu"].pow(2) - outputs["logvar_z"].exp(),
+            dim=1
+        ).mean()
         loss = recon + beta_kl * kl
         return {"loss": loss, "recon": recon, "kl": kl, "beta": torch.tensor(beta_kl)}
 
@@ -396,8 +395,10 @@ def make_beta_fn(cfg: Dict, base_steps_per_epoch: int) -> Callable[[int], float]
 
     if schedule == "linear_warmup" and warmup_steps > 0:
         def beta_fn(step: int) -> float:
-            if step <= 0: return beta_min
-            if step >= warmup_steps: return beta_max
+            if step <= 0:
+                return beta_min
+            if step >= warmup_steps:
+                return beta_max
             return beta_min + (beta_max - beta_min) * (step / warmup_steps)
         return beta_fn
 
@@ -436,10 +437,11 @@ def train_one_epoch(model, dataloader, optimizer, device, beta_fn, start_step=0,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
-        total_loss  += float(losses["loss"].detach())
+        total_loss += float(losses["loss"].detach())
         total_recon += float(losses["recon"].detach())
-        total_kl    += float(losses["kl"].detach())
+        total_kl += float(losses["kl"].detach())
         step += 1
+
     steps = len(dataloader)
     return {"loss": total_loss / steps, "recon": total_recon / steps, "kl": total_kl / steps}, step
 
@@ -454,10 +456,11 @@ def evaluate(model, dataloader, device, beta_fn, start_step=0):
         outputs = model(batch["window"])
         beta = float(beta_fn(step))
         losses = model.loss(outputs, batch["action"], beta)
-        total_loss  += float(losses["loss"].detach())
+        total_loss += float(losses["loss"].detach())
         total_recon += float(losses["recon"].detach())
-        total_kl    += float(losses["kl"].detach())
+        total_kl += float(losses["kl"].detach())
         step += 1
+
     steps = len(dataloader)
     return {"loss": total_loss / steps, "recon": total_recon / steps, "kl": total_kl / steps}, step
 
@@ -503,6 +506,7 @@ def load_checkpoint(
     optimizer.load_state_dict(ckpt["optimizer"])
     if scheduler is not None and ckpt.get("scheduler") is not None:
         scheduler.load_state_dict(ckpt["scheduler"])
+
     try:
         rng = ckpt.get("rng", {})
         if rng:
@@ -531,7 +535,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         device = torch.device(f"cuda:{dev_idx}")
     else:
         device = torch.device("cpu")
-    LOGGER.info("Using device: %s", device)
 
     # seeds, dirs
     set_seed(int(config["seed"]))
@@ -540,6 +543,10 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
     run_dir = (run_dir or Path(paths_cfg.get("run_dir", "output/runs/global_cvae"))).expanduser()
     configure_logging(run_dir)
 
+    LOGGER.info("Using device: %s", device)
+    LOGGER.info("Data root: %s", data_root)
+    LOGGER.info("Run dir:   %s", run_dir)
+
     # persist config
     try:
         with (run_dir / "config.yaml").open("w", encoding="utf-8") as fp:
@@ -547,28 +554,31 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
     except Exception as e:
         LOGGER.warning("Could not save run config: %s", e)
 
-    # datasets
-    T = int(config["window_len"])
+    # ---- datasets (Option B: infer T from data) ----
     exp_cfg = config.get("data", {}).get("experiment")
 
     if exp_cfg:
         LOGGER.info("Using explicit experiment configuration.")
         train_pairs = expand_experiment_entries(data_root, exp_cfg.get("train", []))
-        val_pairs   = expand_experiment_entries(data_root, exp_cfg.get("val",   exp_cfg.get("train", [])))
+        val_pairs = expand_experiment_entries(data_root, exp_cfg.get("val", exp_cfg.get("train", [])))
         if "test" in exp_cfg:
             LOGGER.info("Ignoring 'data.experiment.test' in training config (tests are evaluated separately).")
-        # Convert (policy, root) -> roots
         train_roots = [rp for (_pol, rp) in train_pairs]
-        val_roots   = [rp for (_pol, rp) in val_pairs]
+        val_roots = [rp for (_pol, rp) in val_pairs]
     else:
         cat = config.get("data", {}).get("category", "iid")
         LOGGER.info("No experiment config; falling back to category='%s' for all policies.", cat)
         roots = discover_policy_roots(data_root, cat)
         train_roots = roots
-        val_roots   = roots
+        val_roots = roots
 
-    train_ds, train_idmap = build_concat_dataset(train_roots, split="train", window_len=T)
-    val_ds,   val_idmap   = build_concat_dataset(val_roots,   split="val",   window_len=T)
+    train_ds, train_idmap = build_concat_dataset(train_roots, split="train", device=None, include_policy_id=True)
+    T = infer_concat_window_len(train_ds)
+
+    val_ds, val_idmap = build_concat_dataset(val_roots, split="val", device=None, include_policy_id=True)
+    _ = infer_concat_window_len(val_ds)  # raises if mismatch
+
+    LOGGER.info("Using inferred window_len T=%d (from stored NPZ windows).", T)
 
     # Save a merged policy map (train/val only)
     try:
@@ -594,7 +604,7 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         collate_fn=next_frame_collate,
     )
 
-    # model/optim/sched
+    # ---- model/optim/sched ----
     model_cfg = config["model"]
     model = GlobalCVAE(
         window_len=T,
@@ -617,6 +627,7 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         betas=tuple(optimizer_cfg.get("betas", [0.9, 0.999])),
         weight_decay=float(optimizer_cfg.get("weight_decay", 0.0)),
     )
+
     scheduler_cfg = config.get("scheduler", {})
     scheduler = linear_warmup_scheduler(
         optimizer,
@@ -676,7 +687,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         ])
         csv_f.flush()
 
-        # periodic validation + checkpointing
         if (epoch == start_epoch) or (global_step % validate_interval == 0) or (epoch == epochs):
             val_metrics, _ = evaluate(model, val_loader, device, beta_fn, start_step=global_step)
             LOGGER.info(
@@ -692,7 +702,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
             ])
             csv_f.flush()
 
-            # save last/best
             save_checkpoint(last_ckpt, epoch, global_step, best_val, model, optimizer, scheduler)
             if best_val is None or val_metrics["loss"] < best_val:
                 best_val = val_metrics["loss"]
@@ -705,7 +714,7 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
 # ---------- CLI ----------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train global CVAE across selected policies")
+    p = argparse.ArgumentParser(description="Train global CVAE across selected policies (Option B)")
     p.add_argument("--config", type=str, default="policyOrProxy/cfg/train_global_cvae.yaml")
     p.add_argument("--data_root", type=str, help="Override data root (default from YAML)")
     p.add_argument("--run_dir", type=str, help="Override run directory (default from YAML)")

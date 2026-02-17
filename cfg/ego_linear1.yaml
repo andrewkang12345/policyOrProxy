@@ -1,0 +1,17 @@
+# ego_policy_linear_pure.yaml
+policy_class: linear
+identifier: ego_linear_pure
+init_seed: 1
+
+feature_mode: flatten
+state_dim: 4
+
+num_components: 1
+policy_purity: pure
+mixture_temperature: 1.0
+
+weight_scale: 0.01
+bias_scale: 0.0
+
+gate_weight_scale: 0.5
+gate_bias_scale: 0.0

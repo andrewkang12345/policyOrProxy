@@ -1,0 +1,28 @@
+arena:
+  height: 25.0
+  # obstacles:
+  # - center:
+  #   - 10.0
+  #   - 12.5
+  #   radius: 3.0
+  # - center:
+  #   - 30.0
+  #   - 12.5
+  #   radius: 2.5
+  width: 40.0
+opponents_root: output/opponents
+output_root: output/data
+rollout:
+  episodes:
+    test: 1
+    train: 1
+    val: 1
+  seed: 5
+  steps: 160
+world:
+  agents_per_team: 3
+  dt: 0.2
+  window_len: 2
+  max_speed: 3.5
+  perturbation_std: 0.0
+  teams: 2

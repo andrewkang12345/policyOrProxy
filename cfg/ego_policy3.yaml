@@ -1,13 +1,15 @@
-window_len: 6
-num_buckets: 2048
-num_prototypes: 4
-noise_std: 0.05
-sampling: stochastic  # options: stochastic, argmax
+policy_class: window_hash
+# policy_class: window_hash | linear | mlp_random | gp_rff
+
+num_buckets: 4
+num_components: 4
+noise_std: 0.0
+policy_purity: pure  # options: pure, mixed
 quantization:
   grid_size: 32
-  jitter: 0.01
+  jitter: 0.0
   length_scale: 1.0
   clamp: true
 prototype_init:
   max_speed: 3.5
-  seed: 8
+  seed: 9

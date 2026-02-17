@@ -1,0 +1,21 @@
+# ego_policy_mlp_pure.yaml
+policy_class: mlp_random
+identifier: ego_mlp_pure
+init_seed: 1
+
+feature_mode: flatten
+state_dim: 4
+
+activation: tanh        # tanh | relu | gelu
+hidden_dims: [128, 128]
+
+num_components: 1
+policy_purity: pure
+mixture_temperature: 1.0
+
+weight_scale: 0.5
+bias_scale: 0.0
+
+# gating head scales (not meaningful for K=1, but allowed)
+gate_weight_scale: 0.5
+gate_bias_scale: 0.0

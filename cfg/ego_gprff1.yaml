@@ -1,0 +1,25 @@
+# ego_policy_gp_rff_pure.yaml
+policy_class: gp_rff
+identifier: ego_gp_rff_pure
+init_seed: 1
+
+# Feature construction for window -> x
+feature_mode: flatten         # last | mean | flatten
+state_dim: 4               # optional; defaults to 4 in from_cfg
+
+# Mixture (K=1 => effectively no mixture)
+num_components: 1
+policy_purity: pure        # "pure" => deterministic component choice
+mixture_temperature: 1.0
+
+# RFF kernel approx
+rff_dim: 512
+length_scale: 1.0
+
+# Output scales (weights/biases)
+output_scale: 10.0
+bias_scale: 0.0
+
+# Gate scales (unused in practice for K=1 but still created)
+gate_weight_scale: 1.0
+gate_bias_scale: 0.0

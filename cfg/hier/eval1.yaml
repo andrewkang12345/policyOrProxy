@@ -1,4 +1,4 @@
-model_type: hier          # or hier | mapd
+model_type: grover          # or hier | mapd
 device: auto                # or "cpu"
 batch_size: 128
 num_workers: 4

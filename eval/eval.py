@@ -1,14 +1,21 @@
 # File: policyOrProxy/eval/eval.py
 #!/usr/bin/env python3
 """
-Universal evaluation for trained (Global/Hier/MAPD) CVAE-like models.
+Universal evaluation for trained (Global/Hier/MAPD) CVAE-like models + Grover-style representation model.
 
-- Test data is configured independently from training.
+What it does
+------------
+- Test data is configured independently from training (eval.yaml).
 - Supports per-policy, per-distribution mixes via YAML "data.experiment.test".
 - Embedding clustering metric: IICR = (mean intra-cluster distance) / (mean inter-centroid distance).
 - Optional linear-probe policy classification accuracy on embeddings when all test policies
   were *seen during training* (based on the training YAML).
 - Logs train/test distribution configuration per policy into the results JSON.
+
+Supports model_type:
+- "global" -> GlobalCVAE (latent_key="mu")
+- "hier"   -> HierarchicalCVAE (latent_key="mu_global")
+- "grover" -> GroverModel (latent_key="mu")  <-- added
 
 Example eval.yaml (test-only) is at the end of this file.
 """
@@ -39,6 +46,9 @@ from policyOrProxy.models.collate import move_batch, next_frame_collate
 from policyOrProxy.models.train_global_cvae import GlobalCVAE
 from policyOrProxy.models.train_hier_cvae import HierarchicalCVAE
 from policyOrProxy.core.metrics.metrics import linear_probe_accuracy
+
+# NEW: import the Grover model (from your training script)
+from policyOrProxy.models.train_grover_embed import GroverModel  # noqa: E402
 
 LOGGER = logging.getLogger("eval")
 
@@ -94,15 +104,16 @@ def _normalize_entries(entries: Union[Dict, List, str]) -> List[Dict]:
         return out
     raise ValueError(f"Cannot parse entries of type {type(entries)}")
 
+
 def _normalize_window_shape(w: torch.Tensor) -> torch.Tensor:
     """
     Ensure window shape is [B, T, teams, agents, state] (or [B, T, F] / [B, F]).
     Some dataloaders yield [B, 1, T, teams, agents, state]; squeeze that middle dim.
     """
-    # common nuisance: (B, 1, T, teams, agents, state)
     if w.dim() >= 3 and w.size(1) == 1:
         w = w.squeeze(1)
     return w
+
 
 def expand_experiment_entries(
     data_root: Path, split_entries: List[Dict]
@@ -168,11 +179,11 @@ def expand_experiment_entries(
 
 def build_feature_model(model_type: str, model_cfg: Dict, device: torch.device):
     """
-    Returns (model, latent_key, extras).
-    Use deterministic embeddings by default:
+    Returns (model, latent_key, extras) where forward_fn should return a dict containing latent_key.
+    Deterministic latent keys by default:
       - global: 'mu'
       - hier:   'mu_global'
-      - mapd:   'z' (stochastic unless you add a deterministic head)
+      - grover: 'mu' (we map GroverModel.embed(...) -> {'mu': ...})
     """
     if model_type == "global":
         model = GlobalCVAE(
@@ -205,6 +216,25 @@ def build_feature_model(model_type: str, model_cfg: Dict, device: torch.device):
             action_dim=int(model_cfg["model"]["action_dim"]),
         ).to(device)
         latent_key = "mu_global"
+        return model, latent_key, {}
+
+    if model_type == "grover":
+        # Expect same keys you used in train_grover_embed.yaml
+        mcfg = model_cfg["model"]
+        loss_cfg = model_cfg.get("loss", {})
+        model = GroverModel(
+            teams=int(mcfg["teams"]),
+            agents=int(mcfg["agents"]),
+            state_dim=int(mcfg["state_dim"]),
+            action_dim=int(mcfg["action_dim"]),
+            embed_dim=int(mcfg["embed_dim"]),
+            encoder_hidden=int(mcfg["encoder_hidden"]),
+            policy_hidden=int(mcfg["policy_hidden"]),
+            dropout=float(mcfg["dropout"]),
+            gaussian_min_logvar=float(loss_cfg.get("gaussian_min_logvar", -6.0)),
+        ).to(device)
+        # We’ll expose embeddings under 'mu' for consistency with CVAEs
+        latent_key = "mu"
         return model, latent_key, {}
 
     raise ValueError(f"Unsupported model type {model_type}")
@@ -321,14 +351,11 @@ def safe_torch_load(path: Path, map_location: torch.device):
     Robust torch.load that handles PyTorch 2.6+ (weights_only=True default) and
     allowlists numpy's reconstruct helper when needed.
     """
-    # Try new API with weights_only override
     try:
         return torch.load(path, map_location=map_location, weights_only=False)
     except TypeError:
-        # Older Torch without weights_only arg
         return torch.load(path, map_location=map_location)
     except Exception as e:
-        # If it's the safe unpickler complaining about numpy reconstruct, allowlist it and retry
         try:
             from torch.serialization import add_safe_globals  # type: ignore
             import numpy as np  # noqa
@@ -378,25 +405,15 @@ def main(args) -> None:
     target.eval()
 
     # --- Forward function
-    if model_type == "mapd":
-        data_cfg = load_yaml(Path(extras["data_config"]))
-        ego_cfg = load_yaml(Path(extras["ego_policy"]))
-        regionizer = build_regionizer(data_cfg, ego_cfg)
-
-        paths_cfg = model_cfg.get("paths", {})
-        base_root = Path(paths_cfg.get("train_root", paths_cfg.get("data_root", "output/data"))).expanduser()
-        base_indexer = EpisodeIndexer.load(base_root)
-        base_ds = NextFrameDataset(base_root, base_indexer, split="train", include_policy_id=False)
-        bank = build_action_bank(base_ds, regionizer)
-        samples_per_state = extras["samples_per_state"]
-
+    if model_type == "grover":
         @torch.no_grad()
         def forward_fn(batch):
             w = _normalize_window_shape(batch["window"])
-            dist_features = sample_distribution_features(
-                w, batch["action"], regionizer, bank, samples_per_state
-            )
-            return model(w, dist_features)
+            # Return dict to match downstream API
+            return {"mu": model.embed(w)}
+    elif model_type == "mapd":
+        # (Left intact if you had MAPD utilities wired elsewhere.)
+        raise NotImplementedError("model_type 'mapd' is not supported in this build.")
     else:
         @torch.no_grad()
         def forward_fn(batch):

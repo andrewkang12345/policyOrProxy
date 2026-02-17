@@ -1,29 +1,15 @@
 #!/usr/bin/env python3
 """
-Train a hierarchical latent CVAE across *multiple policies* with a clean config.
+Train a hierarchical latent CVAE across multiple policies (Option B).
 
 Key points
-- NEVER reads output/data/index.json at the root.
-- Discovers/uses child folders that each contain their own index.json:
+- Child folders contain their own index.json:
     - iid:             <data_root>/ego_policy*/iid
     - ood_manual+NAME: <data_root>/ood_manual/ego_policy*/NAME
 - Also supports explicit experiment lists (paths or (policy, category) globs).
-- ConcatDataset over policies (keeps episode_ids to aggregate per-episode global latents).
-- Resumable training (model/opt/sched/global_step/epoch/RNG).
-- CSV metrics + train.log + policies.json.
-- Picks emptiest CUDA device (no DataParallel by default).
-
-Config (see your train_hier_cvae1.yaml):
-data:
-  # either a single category across all discovered policies:
-  #   category: iid
-  # or an explicit experiment with per-policy entries:
-  experiment:
-    train:
-      - {path: "output/data/ego_policy1/iid"}
-      - {policy: "ego_policy*", category: "iid"}
-    val:
-      - {path: "output/data/ego_policy2/iid"}
+- ConcatDataset over policies.
+- Window length T is inferred from NPZ windows and enforced consistent.
+- Episode IDs are made globally unique across concatenated roots (required for correct global-latent aggregation).
 """
 
 from __future__ import annotations
@@ -35,7 +21,7 @@ import logging
 import math
 import random
 from pathlib import Path
-from typing import Dict, Callable, Optional, List, Tuple, Iterable, Union
+from typing import Dict, Optional, List, Tuple, Iterable, Union
 import sys
 
 import yaml
@@ -44,7 +30,6 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, ConcatDataset
 
-# repo bootstrap
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = PACKAGE_ROOT.parent
 if str(REPO_ROOT) not in sys.path:
@@ -95,11 +80,44 @@ def pick_emptiest_cuda_device() -> Optional[int]:
 
 # ---------------- data helpers ----------------
 
+def infer_concat_window_len(ds: ConcatDataset) -> int:
+    if not hasattr(ds, "datasets") or not ds.datasets:
+        raise ValueError("ConcatDataset is empty; cannot infer window length.")
+    first = ds.datasets[0]
+    T = getattr(first, "window_len", None)
+    if T is None:
+        raise ValueError("Underlying dataset did not set window_len; cannot infer.")
+    for sub in ds.datasets[1:]:
+        if getattr(sub, "window_len", None) != T:
+            raise ValueError(
+                f"Mismatched window_len across datasets: {getattr(sub,'window_len',None)} vs {T}"
+            )
+    return int(T)
+
+
+class WithEpisodeOffset(torch.utils.data.Dataset):
+    """
+    Wraps a dataset and adds a constant offset to its 'episode_id'
+    so ConcatDataset episode IDs are globally unique.
+
+    Required for hierarchical CVAE global-latent aggregation by episode_id.
+    """
+    def __init__(self, base_ds, episode_offset: int):
+        self.base = base_ds
+        self.episode_offset = int(episode_offset)
+        self.window_len = getattr(base_ds, "window_len", None)
+
+    def __len__(self):
+        return len(self.base)
+
+    def __getitem__(self, i):
+        sample = self.base[i]
+        if "episode_id" in sample:
+            sample["episode_id"] = sample["episode_id"] + self.episode_offset
+        return sample
+
+
 def parse_category(cat: str) -> Tuple[str, Optional[str]]:
-    """
-    'iid' -> ('iid', None)
-    'ood_manual+right_bias_mild' -> ('ood_manual', 'right_bias_mild')
-    """
     parts = cat.split("+")
     if len(parts) == 1:
         return parts[0], None
@@ -118,7 +136,6 @@ def category_to_root(data_root: Path, policy: str, category: str) -> Path:
 
 
 def _normalize_entries(entries: Union[Dict, List, str]) -> List[Dict]:
-    """Accepts dict/list/str and returns a flat list of dict entries."""
     if isinstance(entries, str):
         return [{"policy": entries}]
     if isinstance(entries, dict):
@@ -132,14 +149,6 @@ def _normalize_entries(entries: Union[Dict, List, str]) -> List[Dict]:
 
 
 def expand_experiment_entries(data_root: Path, split_entries: List[Dict]) -> List[Tuple[str, Path]]:
-    """
-    Build a list of (policy_name, dataset_root) pairs.
-    Each entry can be:
-      - {policy: "ego_policy1", category: "iid"}
-      - {policy: "ego_policy*", category: "ood_manual+right_bias_mild"}  # glob
-      - {path: "output/data/ood_manual/ego_policy2/right_bias_moderate"} # explicit
-      - {policy: "ego_policy3", exclude: true}                            # skip
-    """
     resolved: List[Tuple[str, Path]] = []
     for ent in _normalize_entries(split_entries):
         if ent.get("exclude", False):
@@ -174,7 +183,6 @@ def expand_experiment_entries(data_root: Path, split_entries: List[Dict]) -> Lis
 
         LOGGER.warning("Unrecognized split entry, ignored: %s", ent)
 
-    # dedupe
     seen = set()
     uniq = []
     for pol, rp in resolved:
@@ -187,10 +195,6 @@ def expand_experiment_entries(data_root: Path, split_entries: List[Dict]) -> Lis
 
 
 def discover_policy_roots(data_root: Path, category: str) -> List[Path]:
-    """
-    iid:             <data_root>/ego_policy*/iid
-    ood_manual+NAME: <data_root>/ood_manual/ego_policy*/NAME
-    """
     base, sub = parse_category(category)
     roots: List[Path] = []
 
@@ -214,32 +218,40 @@ def discover_policy_roots(data_root: Path, category: str) -> List[Path]:
 def build_concat_dataset(
     pairs: List[Tuple[str, Path]],
     split: str,
-    window_len: int,
     include_policy_id: bool = True,
 ) -> Tuple[ConcatDataset, Dict[int, str]]:
     """
-    For each (policy, root), wrap NextFrameDataset and concat.
+    For each (policy, root), load NextFrameDataset and concat.
     Also collect a {int_id: policy_name} bookkeeping map.
+    Applies WithEpisodeOffset to make episode IDs unique across roots.
     """
-    datasets: List[NextFrameDataset] = []
+    datasets: List[torch.utils.data.Dataset] = []
     id_map: Dict[int, str] = {}
     next_id = 0
 
+    episode_offset = 0
     for policy, root in pairs:
-        indexer = EpisodeIndexer.load(root)  # <-- child folder's index.json
+        indexer = EpisodeIndexer.load(root)
         if not any(rec.split == split for rec in indexer.entries):
             LOGGER.warning("Skipping %s — no '%s' split found.", root, split)
             continue
 
-        ds = NextFrameDataset(
+        base_ds = NextFrameDataset(
             root=root,
             indexer=indexer,
             split=split,
-            device=None,                 # moved later in collate
+            device=None,
             preload=False,
             include_policy_id=include_policy_id,
-            window_len=window_len,
         )
+
+        # Make episode IDs unique across concatenated datasets.
+        ds = WithEpisodeOffset(base_ds, episode_offset=episode_offset)
+
+        # Advance offset by number of episodes in this dataset.
+        n_eps = len(getattr(base_ds, "records", []))
+        episode_offset += int(n_eps)
+
         id_map[next_id] = policy
         next_id += 1
         datasets.append(ds)
@@ -316,7 +328,6 @@ class HierarchicalCVAE(nn.Module):
         )
 
     def _normalize_window(self, window: torch.Tensor) -> torch.Tensor:
-        # Accept (B,1,T,teams,agents,state) or (B,T,teams,agents,state)
         if window.dim() >= 3 and window.size(1) == 1:
             window = window.squeeze(1)
         return window
@@ -329,10 +340,9 @@ class HierarchicalCVAE(nn.Module):
         embedded = self.input_proj(flat)
         embedded = self.positional(embedded)
         encoded = self.encoder(embedded)
-        sequence_context = encoded.mean(dim=1)                    # [B, d_model]
+        sequence_context = encoded.mean(dim=1)
 
-        last_frame = window[:, -1]                                # [B, teams, agents, state]
-        # build per-agent context by reshaping
+        last_frame = window[:, -1]
         per_agent = last_frame.reshape(B, self.teams * self.agents, self.state_dim)
         local_context = per_agent.view(B, self.agents, self.teams * self.state_dim)
         return {"sequence_context": sequence_context, "local_context": local_context}
@@ -351,7 +361,7 @@ class HierarchicalCVAE(nn.Module):
         deterministic: bool = False,
     ) -> Dict[str, torch.Tensor]:
         enc = self.encode(window)
-        seq_ctx = enc["sequence_context"]  # [B, d_model]
+        seq_ctx = enc["sequence_context"]
         device = window.device
         B = seq_ctx.size(0)
 
@@ -360,7 +370,6 @@ class HierarchicalCVAE(nn.Module):
         else:
             episode_ids = episode_ids.to(device=device, dtype=torch.long)
 
-        # aggregate context per episode id
         uniq, inv = torch.unique(episode_ids, sorted=True, return_inverse=True)
         sums = torch.zeros(uniq.size(0), seq_ctx.size(-1), device=device)
         sums.index_add_(0, inv, seq_ctx)
@@ -370,18 +379,24 @@ class HierarchicalCVAE(nn.Module):
         mu_g = self.to_mu_global(epi_mean)
         logvar_g = self.to_logvar_global(epi_mean)
         z_g_epi = self._sample(mu_g, logvar_g, deterministic)
-        # map back to batch
+
         mu_global = mu_g[inv]
         logvar_global = logvar_g[inv]
         z_global = z_g_epi[inv]
 
-        local_in = torch.cat([enc["local_context"], z_global.unsqueeze(1).expand(-1, self.agents, -1)], dim=-1)
+        local_in = torch.cat(
+            [enc["local_context"], z_global.unsqueeze(1).expand(-1, self.agents, -1)],
+            dim=-1
+        )
         local_h = torch.tanh(self.local_hidden(local_in))
         mu_l = self.to_mu_local(local_h)
         logvar_l = self.to_logvar_local(local_h)
         z_l = self._sample(mu_l, logvar_l, deterministic)
 
-        dec_in = torch.cat([enc["local_context"], z_global.unsqueeze(1).expand(-1, self.agents, -1), z_l], dim=-1)
+        dec_in = torch.cat(
+            [enc["local_context"], z_global.unsqueeze(1).expand(-1, self.agents, -1), z_l],
+            dim=-1
+        )
         out = self.decoder(dec_in).view(B, self.agents, self.action_dim, 2)
         mean = out[..., 0]
         logvar = out[..., 1]
@@ -506,7 +521,6 @@ def evaluate(model, dataloader, device):
 
 
 def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None = None, resume: bool = True) -> None:
-    # device
     prefer_free_gpu = bool(config.get("prefer_free_gpu", True))
     if torch.cuda.is_available() and config.get("device", "auto") != "cpu":
         dev_idx = pick_emptiest_cuda_device() if prefer_free_gpu else 0
@@ -516,22 +530,18 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         device = torch.device("cpu")
     LOGGER.info("Using device: %s", device)
 
-    # seeds, dirs
     set_seed(int(config["seed"]))
     paths_cfg = config.get("paths", {})
     data_root = (data_root or Path(paths_cfg.get("data_root", "output/data"))).expanduser()
     run_dir = (run_dir or Path(paths_cfg.get("run_dir", "output/runs/hier_cvae"))).expanduser()
     configure_logging(run_dir)
 
-    # persist config
     try:
         with (run_dir / "config.yaml").open("w", encoding="utf-8") as fp:
             yaml.safe_dump(config, fp)
     except Exception as e:
         LOGGER.warning("Could not save run config: %s", e)
 
-    # discover policies / roots from config (NO root-level index.json access!)
-    T = int(config["window_len"])
     exp_cfg = config.get("data", {}).get("experiment")
     if exp_cfg:
         LOGGER.info("Using explicit experiment configuration.")
@@ -544,9 +554,12 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         train_pairs = [(p.parent.name if p.parent.name.startswith("ego_policy") else p.name, p) for p in roots]
         val_pairs   = train_pairs
 
-    # datasets & loaders (concat of child folders)
-    train_ds, train_idmap = build_concat_dataset(train_pairs, split="train", window_len=T, include_policy_id=True)
-    val_ds,   val_idmap   = build_concat_dataset(val_pairs,   split="val",   window_len=T, include_policy_id=True)
+    train_ds, train_idmap = build_concat_dataset(train_pairs, split="train", include_policy_id=True)
+    T = infer_concat_window_len(train_ds)
+    val_ds,   val_idmap   = build_concat_dataset(val_pairs,   split="val",   include_policy_id=True)
+    _ = infer_concat_window_len(val_ds)
+
+    LOGGER.info("Using inferred window_len T=%d (from stored NPZ windows).", T)
 
     train_loader = DataLoader(
         train_ds, batch_size=int(config["batch_size"]), shuffle=True,
@@ -559,14 +572,12 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         collate_fn=next_frame_collate,
     )
 
-    # Save mapping for debugging later
     try:
         with (run_dir / "policies.json").open("w", encoding="utf-8") as fp:
             json.dump({"train": train_idmap, "val": val_idmap}, fp, indent=2)
     except Exception as e:
         LOGGER.warning("Could not write policies.json: %s", e)
 
-    # model / opt / sched
     model_cfg = config["model"]
     latent_cfg = config["latent_dim"]
     model = HierarchicalCVAE(
@@ -597,7 +608,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
         min_lr=float(scheduler_cfg.get("min_lr", optimizer_cfg["lr"])),
     )
 
-    # CSV logger
     metrics_csv_path = run_dir / "metrics.csv"
     new_file = not metrics_csv_path.exists()
     csv_f = metrics_csv_path.open("a", newline="", encoding="utf-8")
@@ -605,7 +615,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
     if new_file:
         csv_writer.writerow(["epoch", "split", "loss", "recon", "kl_global", "kl_local", "lr"])
 
-    # resume
     ckpt_dir = run_dir / "checkpoints"
     last_ckpt = ckpt_dir / "last.pt"
     best_ckpt = ckpt_dir / "best.pt"
@@ -660,7 +669,6 @@ def train_loop(config: Dict, data_root: Path | None = None, run_dir: Path | None
             ])
             csv_f.flush()
 
-            # save last/best
             save_checkpoint(last_ckpt, epoch, global_step, best_val, model, optimizer, scheduler)
             if best_val is None or val_metrics["loss"] < best_val:
                 best_val = val_metrics["loss"]
